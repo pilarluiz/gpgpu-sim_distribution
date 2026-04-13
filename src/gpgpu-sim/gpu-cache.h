@@ -1025,7 +1025,8 @@ class mshr_table {
  public:
   mshr_table(unsigned num_entries, unsigned max_merged)
       : m_num_entries(num_entries),
-        m_max_merged(max_merged)
+        m_max_merged(max_merged),
+        m_cycles_mshr_entry_capacity_full(0)
 #if (tr1_hash_map_ismap == 0)
         ,
         m_data(2 * num_entries)
@@ -1037,6 +1038,13 @@ class mshr_table {
   bool probe(new_addr_type block_addr) const;
   /// Checks if there is space for tracking a new memory access
   bool full(new_addr_type block_addr) const;
+  /// True if distinct MSHR entries in use are at least threshold_percent (0--100)
+  /// of m_num_entries (merge depth is not included).
+  bool occupancy_above_threshold(unsigned threshold_percent) const;
+  /// Count cycles where all MSHR entries are in use (distinct blocks).
+  void cycle_tick_full_counter();
+  unsigned long long get_cycles_mshr_entry_capacity_full() const;
+  void reset_cycles_mshr_entry_capacity_full();
   /// Add or merge this access
   void add(new_addr_type block_addr, mem_fetch *mf);
   /// Returns true if cannot accept new fill responses
@@ -1059,10 +1067,12 @@ class mshr_table {
   }
 
  private:
+  bool at_mshr_entry_capacity() const;
   // finite sized, fully associative table, with a finite maximum number of
   // merged requests
   const unsigned m_num_entries;
   const unsigned m_max_merged;
+  unsigned long long m_cycles_mshr_entry_capacity_full;
 
   struct mshr_entry {
     std::list<mem_fetch *> m_list;
@@ -1286,9 +1296,9 @@ class baseline_cache : public cache_t {
       : m_config(config),
         m_tag_array(new tag_array(config, core_id, type_id)),
         m_mshrs(config.m_mshr_entries, config.m_mshr_max_merge),
-        m_bandwidth_management(config),
         m_level(level),
-        m_gpu(gpu) {
+        m_gpu(gpu),
+        m_bandwidth_management(config) {
     init(name, config, memport, status);
   }
 
@@ -1314,6 +1324,8 @@ class baseline_cache : public cache_t {
                                            std::list<cache_event> &events) = 0;
   /// Sends next request to lower level of memory
   void cycle();
+  unsigned long long get_cycles_mshr_entry_capacity_full() const;
+  void reset_cycles_mshr_entry_capacity_full();
   /// Interface for response from lower memory level (model bandwidth
   /// restictions in caller)
   void fill(mem_fetch *mf, unsigned time);

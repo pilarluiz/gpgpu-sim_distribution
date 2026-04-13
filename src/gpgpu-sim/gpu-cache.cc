@@ -565,6 +565,28 @@ bool mshr_table::full(new_addr_type block_addr) const {
     return m_data.size() >= m_num_entries;
 }
 
+bool mshr_table::occupancy_above_threshold(unsigned threshold_percent) const {
+  if (m_num_entries == 0) return false;
+  double occupancy_percent = 100.0 * m_data.size() / m_num_entries;
+  return occupancy_percent >= threshold_percent;
+}
+
+bool mshr_table::at_mshr_entry_capacity() const {
+  return m_num_entries > 0 && m_data.size() >= m_num_entries;
+}
+
+unsigned long long mshr_table::get_cycles_mshr_entry_capacity_full() const {
+  return m_cycles_mshr_entry_capacity_full;
+}
+
+void mshr_table::reset_cycles_mshr_entry_capacity_full() {
+  m_cycles_mshr_entry_capacity_full = 0;
+}
+
+void mshr_table::cycle_tick_full_counter() {
+  if (at_mshr_entry_capacity()) m_cycles_mshr_entry_capacity_full++;
+}
+
 /// Add or merge this access
 void mshr_table::add(new_addr_type block_addr, mem_fetch *mf) {
   m_data[block_addr].m_list.push_back(mf);
@@ -1224,6 +1246,15 @@ void baseline_cache::cycle() {
   bool fill_port_busy = !m_bandwidth_management.fill_port_free();
   m_stats.sample_cache_port_utility(data_port_busy, fill_port_busy);
   m_bandwidth_management.replenish_port_bandwidth();
+  m_mshrs.cycle_tick_full_counter();
+}
+
+unsigned long long baseline_cache::get_cycles_mshr_entry_capacity_full() const {
+  return m_mshrs.get_cycles_mshr_entry_capacity_full();
+}
+
+void baseline_cache::reset_cycles_mshr_entry_capacity_full() {
+  m_mshrs.reset_cycles_mshr_entry_capacity_full();
 }
 
 /// Interface for response from lower memory level (model bandwidth restictions
