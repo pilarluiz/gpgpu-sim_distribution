@@ -37,6 +37,7 @@
 #include <fstream>
 #include <iostream>
 #include <list>
+#include <vector>
 #include "../abstract_hardware_model.h"
 #include "../option_parser.h"
 #include "../trace.h"
@@ -667,6 +668,19 @@ class gpgpu_sim : public gpgpu_t {
    */
   bool is_SST_mode() { return m_config.is_SST_mode(); }
 
+  /// Per-SM (shader id) cumulative cycles with L1D MSHR at distinct-entry capacity.
+  unsigned long long get_num_cycles_mshr_full(unsigned sid) const;
+  /// Per-SM cumulative cycles with L1D MSHR occupancy >= threshold.
+  unsigned long long get_num_cycles_mshr_above_threshold(unsigned sid) const;
+  unsigned long long get_num_cycles_mshr_full_total() const;
+  unsigned long long get_num_cycles_mshr_above_threshold_total() const;
+  unsigned get_mshr_occupancy_threshold_percent() const {
+    return mshr_occupancy_threshold_percent;
+  }
+  void set_mshr_occupancy_threshold_percent(unsigned p) {
+    mshr_occupancy_threshold_percent = p;
+  }
+
   // backward pointer
   class gpgpu_context *gpgpu_ctx;
 
@@ -684,6 +698,7 @@ class gpgpu_sim : public gpgpu_t {
   void print_shader_cycle_distro(FILE *fout) const;
 
   void gpgpu_debug();
+  void accumulate_mshr_l1d_stats();
 
  protected:
   ///// data /////
@@ -774,6 +789,13 @@ class gpgpu_sim : public gpgpu_t {
   unsigned long long gpu_tot_sim_cycle_parition_util;
   unsigned long long partiton_replys_in_parallel;
   unsigned long long partiton_replys_in_parallel_total;
+
+  /// Per SM (index = sid): cycles where that SM's L1D MSHR has all distinct entries in use.
+  std::vector<unsigned long long> num_cycles_mshr_full_per_sm;
+  /// Per SM: cycles where that SM's L1D MSHR occupancy >= mshr_occupancy_threshold_percent.
+  std::vector<unsigned long long> num_cycles_mshr_above_threshold_per_sm;
+  /// Percent (0--100) for above-threshold; default 80.
+  unsigned mshr_occupancy_threshold_percent;
 
   FuncCache get_cache_config(std::string kernel_name);
   void set_cache_config(std::string kernel_name, FuncCache cacheConfig);

@@ -1257,6 +1257,15 @@ void baseline_cache::reset_cycles_mshr_entry_capacity_full() {
   m_mshrs.reset_cycles_mshr_entry_capacity_full();
 }
 
+bool baseline_cache::mshr_occupancy_at_capacity() const {
+  return m_mshrs.at_mshr_entry_capacity();
+}
+
+bool baseline_cache::mshr_occupancy_above_threshold(
+    unsigned threshold_percent) const {
+  return m_mshrs.occupancy_above_threshold(threshold_percent);
+}
+
 /// Interface for response from lower memory level (model bandwidth restictions
 /// in caller)
 void baseline_cache::fill(mem_fetch *mf, unsigned time) {

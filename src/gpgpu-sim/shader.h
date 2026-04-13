@@ -1407,6 +1407,7 @@ class ldst_unit : public pipelined_simd_unit {
   void get_L1D_sub_stats(struct cache_sub_stats &css) const;
   void get_L1C_sub_stats(struct cache_sub_stats &css) const;
   void get_L1T_sub_stats(struct cache_sub_stats &css) const;
+  l1_cache *get_l1d_cache() const { return m_L1D; }
 
  protected:
   ldst_unit(mem_fetch_interface *icnt,
@@ -2089,6 +2090,7 @@ class shader_core_ctx : public core_t {
   // accessors
   bool fetch_unit_response_buffer_full() const;
   bool ldst_unit_response_buffer_full() const;
+  l1_cache *get_l1d_cache() const { return m_ldst_unit->get_l1d_cache(); }
   unsigned get_not_completed() const { return m_not_completed; }
   unsigned get_n_active_cta() const { return m_n_active_cta; }
   unsigned isactive() const {
@@ -2654,6 +2656,7 @@ class simt_core_cluster {
   void get_L1D_sub_stats(struct cache_sub_stats &css) const;
   void get_L1C_sub_stats(struct cache_sub_stats &css) const;
   void get_L1T_sub_stats(struct cache_sub_stats &css) const;
+  shader_core_ctx *get_shader_core(unsigned idx) const;
 
   void get_icnt_stats(long &n_simt_to_mem, long &n_mem_to_simt) const;
   float get_current_occupancy(unsigned long long &active,

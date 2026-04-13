@@ -43,6 +43,7 @@
 #include "shader.h"
 #include "shader_trace.h"
 
+#include <numeric>
 #include <time.h>
 #include "addrdec.h"
 #include "delayqueue.h"
@@ -1051,6 +1052,10 @@ gpgpu_sim::gpgpu_sim(const gpgpu_sim_config &config, gpgpu_context *ctx)
 
   last_liveness_message_time = 0;
 
+  num_cycles_mshr_full_per_sm.assign(m_shader_config->num_shader(), 0);
+  num_cycles_mshr_above_threshold_per_sm.assign(m_shader_config->num_shader(), 0);
+  mshr_occupancy_threshold_percent = 80;
+
   // Jin: functional simulation for CDP
   m_functional_sim = false;
   m_functional_sim_kernel = NULL;
@@ -1473,6 +1478,31 @@ void gpgpu_sim::gpu_print_stat(unsigned long long streamID) {
   // performance counter for stalls due to congestion.
   printf("gpu_stall_dramfull = %d\n", gpu_stall_dramfull);
   printf("gpu_stall_icnt2sh    = %d\n", gpu_stall_icnt2sh);
+
+  printf("mshr_occupancy_threshold_percent = %u\n",
+         mshr_occupancy_threshold_percent);
+  printf("num_cycles_mshr_full_total = %llu\n",
+         get_num_cycles_mshr_full_total());
+  printf("num_cycles_mshr_above_threshold_total = %llu\n",
+         get_num_cycles_mshr_above_threshold_total());
+  {
+    unsigned long long mshr_full_max = 0, mshr_above_max = 0;
+    for (size_t s = 0; s < num_cycles_mshr_full_per_sm.size(); s++) {
+      if (num_cycles_mshr_full_per_sm[s] > mshr_full_max)
+        mshr_full_max = num_cycles_mshr_full_per_sm[s];
+      if (num_cycles_mshr_above_threshold_per_sm[s] > mshr_above_max)
+        mshr_above_max = num_cycles_mshr_above_threshold_per_sm[s];
+    }
+    printf("num_cycles_mshr_full_per_sm_max = %llu\n", mshr_full_max);
+    printf("num_cycles_mshr_above_threshold_per_sm_max = %llu\n",
+           mshr_above_max);
+  }
+  for (unsigned sid = 0; sid < num_cycles_mshr_full_per_sm.size(); sid++) {
+    printf("num_cycles_mshr_full_per_sm[%u] = %llu\n", sid,
+           num_cycles_mshr_full_per_sm[sid]);
+    printf("num_cycles_mshr_above_threshold_per_sm[%u] = %llu\n", sid,
+           num_cycles_mshr_above_threshold_per_sm[sid]);
+  }
 
   // printf("partiton_reqs_in_parallel = %lld\n", partiton_reqs_in_parallel);
   // printf("partiton_reqs_in_parallel_total    = %lld\n",
@@ -1970,6 +2000,41 @@ void gpgpu_sim::issue_block2core() {
 unsigned long long g_single_step =
     0;  // set this in gdb to single step the pipeline
 
+void gpgpu_sim::accumulate_mshr_l1d_stats() {
+  for (unsigned cid = 0; cid < m_shader_config->n_simt_clusters; cid++) {
+    if (!m_cluster[cid]->get_not_completed() && !get_more_cta_left()) continue;
+    for (unsigned j = 0; j < m_shader_config->n_simt_cores_per_cluster; j++) {
+      unsigned sid = m_shader_config->cid_to_sid(j, cid);
+      l1_cache *l1d = m_cluster[cid]->get_shader_core(j)->get_l1d_cache();
+      if (l1d->mshr_occupancy_at_capacity()) num_cycles_mshr_full_per_sm[sid]++;
+      if (l1d->mshr_occupancy_above_threshold(
+              mshr_occupancy_threshold_percent))
+        num_cycles_mshr_above_threshold_per_sm[sid]++;
+    }
+  }
+}
+
+unsigned long long gpgpu_sim::get_num_cycles_mshr_full(unsigned sid) const {
+  assert(sid < num_cycles_mshr_full_per_sm.size());
+  return num_cycles_mshr_full_per_sm[sid];
+}
+
+unsigned long long gpgpu_sim::get_num_cycles_mshr_above_threshold(
+    unsigned sid) const {
+  assert(sid < num_cycles_mshr_above_threshold_per_sm.size());
+  return num_cycles_mshr_above_threshold_per_sm[sid];
+}
+
+unsigned long long gpgpu_sim::get_num_cycles_mshr_full_total() const {
+  return std::accumulate(num_cycles_mshr_full_per_sm.begin(),
+                         num_cycles_mshr_full_per_sm.end(), 0ull);
+}
+
+unsigned long long gpgpu_sim::get_num_cycles_mshr_above_threshold_total() const {
+  return std::accumulate(num_cycles_mshr_above_threshold_per_sm.begin(),
+                         num_cycles_mshr_above_threshold_per_sm.end(), 0ull);
+}
+
 void gpgpu_sim::cycle() {
   int clock_mask = next_clock_domain();
 
@@ -2080,6 +2145,7 @@ void gpgpu_sim::cycle() {
           gpu_occupancy.aggregate_warp_slot_filled,
           gpu_occupancy.aggregate_theoretical_warp_slots);
     }
+    accumulate_mshr_l1d_stats();
     float temp = 0;
     for (unsigned i = 0; i < m_shader_config->num_shader(); i++) {
       temp += m_shader_stats->m_pipeline_duty_cycle[i];
@@ -2337,6 +2403,8 @@ void sst_gpgpu_sim::SST_cycle() {
   temp = temp / m_shader_config->num_shader();
   *average_pipeline_duty_cycle = ((*average_pipeline_duty_cycle) + temp);
   // cout<<"Average pipeline duty cycle: "<<*average_pipeline_duty_cycle<<endl;
+
+  accumulate_mshr_l1d_stats();
 
   if (g_single_step && ((gpu_sim_cycle + gpu_tot_sim_cycle) >= g_single_step)) {
     asm("int $03");

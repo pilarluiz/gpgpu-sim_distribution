@@ -4511,6 +4511,11 @@ unsigned simt_core_cluster::get_not_completed() const {
   return not_completed;
 }
 
+shader_core_ctx *simt_core_cluster::get_shader_core(unsigned idx) const {
+  assert(idx < m_config->n_simt_cores_per_cluster);
+  return m_core[idx];
+}
+
 void simt_core_cluster::print_not_completed(FILE *fp) const {
   for (unsigned i = 0; i < m_config->n_simt_cores_per_cluster; i++) {
     unsigned not_completed = m_core[i]->get_not_completed();

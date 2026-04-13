@@ -1041,6 +1041,9 @@ class mshr_table {
   /// True if distinct MSHR entries in use are at least threshold_percent (0--100)
   /// of m_num_entries (merge depth is not included).
   bool occupancy_above_threshold(unsigned threshold_percent) const;
+  /// True if all distinct MSHR slots are in use (same as full(addr) when addr is not
+  /// already an MSHR key; if addr is pending, full checks merge depth instead).
+  bool at_mshr_entry_capacity() const;
   /// Count cycles where all MSHR entries are in use (distinct blocks).
   void cycle_tick_full_counter();
   unsigned long long get_cycles_mshr_entry_capacity_full() const;
@@ -1067,7 +1070,6 @@ class mshr_table {
   }
 
  private:
-  bool at_mshr_entry_capacity() const;
   // finite sized, fully associative table, with a finite maximum number of
   // merged requests
   const unsigned m_num_entries;
@@ -1324,6 +1326,8 @@ class baseline_cache : public cache_t {
                                            std::list<cache_event> &events) = 0;
   /// Sends next request to lower level of memory
   void cycle();
+  bool mshr_occupancy_at_capacity() const;
+  bool mshr_occupancy_above_threshold(unsigned threshold_percent) const;
   unsigned long long get_cycles_mshr_entry_capacity_full() const;
   void reset_cycles_mshr_entry_capacity_full();
   /// Interface for response from lower memory level (model bandwidth
