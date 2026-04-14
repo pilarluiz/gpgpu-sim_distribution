@@ -686,6 +686,10 @@ class gpgpu_sim : public gpgpu_t {
   unsigned long long get_num_l1d_mshr_merge_fail_total() const;
   void inc_l1d_mshr_entry_fail(unsigned sid);
   void inc_l1d_mshr_merge_fail(unsigned sid);
+  /// L1D only: MISS_QUEUE_FULL (on-chip miss queue saturated).
+  unsigned long long get_num_l1d_miss_queue_full(unsigned sid) const;
+  unsigned long long get_num_l1d_miss_queue_full_total() const;
+  void inc_l1d_miss_queue_full(unsigned sid);
   unsigned get_mshr_occupancy_threshold_percent() const {
     return mshr_occupancy_threshold_percent;
   }
@@ -812,6 +816,8 @@ class gpgpu_sim : public gpgpu_t {
   std::vector<unsigned long long> num_l1d_mshr_entry_fail_per_sm;
   /// Per SM: L1D MSHR_MERGE_ENRTY_FAIL (merge list full for a line).
   std::vector<unsigned long long> num_l1d_mshr_merge_fail_per_sm;
+  /// Per SM: L1D MISS_QUEUE_FULL.
+  std::vector<unsigned long long> num_l1d_miss_queue_full_per_sm;
   /// Percent (0--100) for above-threshold; default 80.
   unsigned mshr_occupancy_threshold_percent;
 

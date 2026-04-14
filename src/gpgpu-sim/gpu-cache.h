@@ -1452,6 +1452,8 @@ class baseline_cache : public cache_t {
   }
   /// L1D data cache only (name prefix L1D_): split MSHR fail stats vs gpgpu_sim.
   void inc_l1d_mshr_fail_split(bool merge_fail, mem_fetch *mf);
+  /// L1D only: MISS_QUEUE_FULL (on-chip miss queue to next level).
+  void inc_l1d_miss_queue_full(mem_fetch *mf);
   /// Read miss handler without writeback
   void send_read_request(new_addr_type addr, new_addr_type block_addr,
                          unsigned cache_index, mem_fetch *mf, unsigned time,
