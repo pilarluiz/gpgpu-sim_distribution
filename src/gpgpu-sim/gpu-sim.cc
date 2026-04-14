@@ -1054,6 +1054,9 @@ gpgpu_sim::gpgpu_sim(const gpgpu_sim_config &config, gpgpu_context *ctx)
 
   num_cycles_mshr_full_per_sm.assign(m_shader_config->num_shader(), 0);
   num_cycles_mshr_above_threshold_per_sm.assign(m_shader_config->num_shader(), 0);
+  num_l1d_mshr_reservation_fail_per_sm.assign(m_shader_config->num_shader(), 0);
+  num_l1d_mshr_entry_fail_per_sm.assign(m_shader_config->num_shader(), 0);
+  num_l1d_mshr_merge_fail_per_sm.assign(m_shader_config->num_shader(), 0);
   mshr_occupancy_threshold_percent = 80;
 
   // Jin: functional simulation for CDP
@@ -1497,11 +1500,37 @@ void gpgpu_sim::gpu_print_stat(unsigned long long streamID) {
     printf("num_cycles_mshr_above_threshold_per_sm_max = %llu\n",
            mshr_above_max);
   }
+  printf("num_l1d_mshr_reservation_fail_total = %llu\n",
+         get_num_l1d_mshr_reservation_fail_total());
+  printf("num_l1d_mshr_entry_fail_total = %llu\n",
+         get_num_l1d_mshr_entry_fail_total());
+  printf("num_l1d_mshr_merge_fail_total = %llu\n",
+         get_num_l1d_mshr_merge_fail_total());
+  {
+    unsigned long long rf_max = 0, ent_max = 0, mrg_max = 0;
+    for (size_t s = 0; s < num_l1d_mshr_reservation_fail_per_sm.size(); s++) {
+      if (num_l1d_mshr_reservation_fail_per_sm[s] > rf_max)
+        rf_max = num_l1d_mshr_reservation_fail_per_sm[s];
+      if (num_l1d_mshr_entry_fail_per_sm[s] > ent_max)
+        ent_max = num_l1d_mshr_entry_fail_per_sm[s];
+      if (num_l1d_mshr_merge_fail_per_sm[s] > mrg_max)
+        mrg_max = num_l1d_mshr_merge_fail_per_sm[s];
+    }
+    printf("num_l1d_mshr_reservation_fail_per_sm_max = %llu\n", rf_max);
+    printf("num_l1d_mshr_entry_fail_per_sm_max = %llu\n", ent_max);
+    printf("num_l1d_mshr_merge_fail_per_sm_max = %llu\n", mrg_max);
+  }
   for (unsigned sid = 0; sid < num_cycles_mshr_full_per_sm.size(); sid++) {
     printf("num_cycles_mshr_full_per_sm[%u] = %llu\n", sid,
            num_cycles_mshr_full_per_sm[sid]);
     printf("num_cycles_mshr_above_threshold_per_sm[%u] = %llu\n", sid,
            num_cycles_mshr_above_threshold_per_sm[sid]);
+    printf("num_l1d_mshr_reservation_fail_per_sm[%u] = %llu\n", sid,
+           num_l1d_mshr_reservation_fail_per_sm[sid]);
+    printf("num_l1d_mshr_entry_fail_per_sm[%u] = %llu\n", sid,
+           num_l1d_mshr_entry_fail_per_sm[sid]);
+    printf("num_l1d_mshr_merge_fail_per_sm[%u] = %llu\n", sid,
+           num_l1d_mshr_merge_fail_per_sm[sid]);
   }
 
   // printf("partiton_reqs_in_parallel = %lld\n", partiton_reqs_in_parallel);
@@ -2033,6 +2062,52 @@ unsigned long long gpgpu_sim::get_num_cycles_mshr_full_total() const {
 unsigned long long gpgpu_sim::get_num_cycles_mshr_above_threshold_total() const {
   return std::accumulate(num_cycles_mshr_above_threshold_per_sm.begin(),
                          num_cycles_mshr_above_threshold_per_sm.end(), 0ull);
+}
+
+unsigned long long gpgpu_sim::get_num_l1d_mshr_reservation_fail(
+    unsigned sid) const {
+  assert(sid < num_l1d_mshr_reservation_fail_per_sm.size());
+  return num_l1d_mshr_reservation_fail_per_sm[sid];
+}
+
+unsigned long long gpgpu_sim::get_num_l1d_mshr_reservation_fail_total() const {
+  return std::accumulate(num_l1d_mshr_reservation_fail_per_sm.begin(),
+                         num_l1d_mshr_reservation_fail_per_sm.end(), 0ull);
+}
+
+void gpgpu_sim::inc_l1d_mshr_reservation_fail(unsigned sid) {
+  assert(sid < num_l1d_mshr_reservation_fail_per_sm.size());
+  num_l1d_mshr_reservation_fail_per_sm[sid]++;
+}
+
+unsigned long long gpgpu_sim::get_num_l1d_mshr_entry_fail(unsigned sid) const {
+  assert(sid < num_l1d_mshr_entry_fail_per_sm.size());
+  return num_l1d_mshr_entry_fail_per_sm[sid];
+}
+
+unsigned long long gpgpu_sim::get_num_l1d_mshr_entry_fail_total() const {
+  return std::accumulate(num_l1d_mshr_entry_fail_per_sm.begin(),
+                         num_l1d_mshr_entry_fail_per_sm.end(), 0ull);
+}
+
+unsigned long long gpgpu_sim::get_num_l1d_mshr_merge_fail(unsigned sid) const {
+  assert(sid < num_l1d_mshr_merge_fail_per_sm.size());
+  return num_l1d_mshr_merge_fail_per_sm[sid];
+}
+
+unsigned long long gpgpu_sim::get_num_l1d_mshr_merge_fail_total() const {
+  return std::accumulate(num_l1d_mshr_merge_fail_per_sm.begin(),
+                         num_l1d_mshr_merge_fail_per_sm.end(), 0ull);
+}
+
+void gpgpu_sim::inc_l1d_mshr_entry_fail(unsigned sid) {
+  assert(sid < num_l1d_mshr_entry_fail_per_sm.size());
+  num_l1d_mshr_entry_fail_per_sm[sid]++;
+}
+
+void gpgpu_sim::inc_l1d_mshr_merge_fail(unsigned sid) {
+  assert(sid < num_l1d_mshr_merge_fail_per_sm.size());
+  num_l1d_mshr_merge_fail_per_sm[sid]++;
 }
 
 void gpgpu_sim::cycle() {

@@ -2030,6 +2030,7 @@ mem_stage_stall_type ldst_unit::process_cache_access(
     result = BK_CONF;
     assert(!read_sent);
     assert(!write_sent);
+    if (cache == m_L1D) m_gpu->inc_l1d_mshr_reservation_fail(m_sid);
     delete mf;
   } else {
     assert(status == MISS || status == HIT_RESERVED);
@@ -2183,6 +2184,7 @@ void ldst_unit::L1_latency_queue_cycle() {
       } else if (status == RESERVATION_FAIL) {
         assert(!read_sent);
         assert(!write_sent);
+        m_gpu->inc_l1d_mshr_reservation_fail(m_sid);
       } else {
         assert(status == MISS || status == HIT_RESERVED);
         l1_latency_queue[j][0] = NULL;

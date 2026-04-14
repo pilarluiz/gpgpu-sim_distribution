@@ -674,6 +674,18 @@ class gpgpu_sim : public gpgpu_t {
   unsigned long long get_num_cycles_mshr_above_threshold(unsigned sid) const;
   unsigned long long get_num_cycles_mshr_full_total() const;
   unsigned long long get_num_cycles_mshr_above_threshold_total() const;
+  /// L1D: any RESERVATION_FAIL on the LD/ST path (MSHR, miss queue, etc.); one count per failed attempt / retry.
+  unsigned long long get_num_l1d_mshr_reservation_fail(unsigned sid) const;
+  unsigned long long get_num_l1d_mshr_reservation_fail_total() const;
+  void inc_l1d_mshr_reservation_fail(unsigned sid);
+  /// L1D only: MSHR distinct-entry table full (cannot track a new block).
+  unsigned long long get_num_l1d_mshr_entry_fail(unsigned sid) const;
+  unsigned long long get_num_l1d_mshr_entry_fail_total() const;
+  /// L1D only: MSHR merge list full for an already-pending block.
+  unsigned long long get_num_l1d_mshr_merge_fail(unsigned sid) const;
+  unsigned long long get_num_l1d_mshr_merge_fail_total() const;
+  void inc_l1d_mshr_entry_fail(unsigned sid);
+  void inc_l1d_mshr_merge_fail(unsigned sid);
   unsigned get_mshr_occupancy_threshold_percent() const {
     return mshr_occupancy_threshold_percent;
   }
@@ -794,6 +806,12 @@ class gpgpu_sim : public gpgpu_t {
   std::vector<unsigned long long> num_cycles_mshr_full_per_sm;
   /// Per SM: cycles where that SM's L1D MSHR occupancy >= mshr_occupancy_threshold_percent.
   std::vector<unsigned long long> num_cycles_mshr_above_threshold_per_sm;
+  /// Per SM: L1D any RESERVATION_FAIL (superset of MSHR entry/merge).
+  std::vector<unsigned long long> num_l1d_mshr_reservation_fail_per_sm;
+  /// Per SM: L1D MSHR_ENRTY_FAIL (no free distinct MSHR line).
+  std::vector<unsigned long long> num_l1d_mshr_entry_fail_per_sm;
+  /// Per SM: L1D MSHR_MERGE_ENRTY_FAIL (merge list full for a line).
+  std::vector<unsigned long long> num_l1d_mshr_merge_fail_per_sm;
   /// Percent (0--100) for above-threshold; default 80.
   unsigned mshr_occupancy_threshold_percent;
 
