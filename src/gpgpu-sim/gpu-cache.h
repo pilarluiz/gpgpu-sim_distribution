@@ -1328,6 +1328,9 @@ class baseline_cache : public cache_t {
   void cycle();
   bool mshr_occupancy_at_capacity() const;
   bool mshr_occupancy_above_threshold(unsigned threshold_percent) const;
+  /// Miss queue (pending requests to lower level): occupancy fraction of m_miss_queue_size.
+  bool miss_queue_at_capacity() const;
+  bool miss_queue_occupancy_above_threshold(unsigned threshold_percent) const;
   unsigned long long get_cycles_mshr_entry_capacity_full() const;
   void reset_cycles_mshr_entry_capacity_full();
   /// Interface for response from lower memory level (model bandwidth

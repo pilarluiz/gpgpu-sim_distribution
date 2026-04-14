@@ -696,6 +696,19 @@ class gpgpu_sim : public gpgpu_t {
   void set_mshr_occupancy_threshold_percent(unsigned p) {
     mshr_occupancy_threshold_percent = p;
   }
+  /// Per-SM cycles with L1D miss queue full (all slots used).
+  unsigned long long get_num_cycles_l1d_miss_queue_at_capacity(unsigned sid) const;
+  unsigned long long get_num_cycles_l1d_miss_queue_at_capacity_total() const;
+  /// Per-SM cycles with L1D miss queue occupancy >= miss_queue_occupancy_threshold_percent.
+  unsigned long long get_num_cycles_l1d_miss_queue_above_threshold(
+      unsigned sid) const;
+  unsigned long long get_num_cycles_l1d_miss_queue_above_threshold_total() const;
+  unsigned get_miss_queue_occupancy_threshold_percent() const {
+    return miss_queue_occupancy_threshold_percent;
+  }
+  void set_miss_queue_occupancy_threshold_percent(unsigned p) {
+    miss_queue_occupancy_threshold_percent = p;
+  }
 
   // backward pointer
   class gpgpu_context *gpgpu_ctx;
@@ -818,8 +831,15 @@ class gpgpu_sim : public gpgpu_t {
   std::vector<unsigned long long> num_l1d_mshr_merge_fail_per_sm;
   /// Per SM: L1D MISS_QUEUE_FULL.
   std::vector<unsigned long long> num_l1d_miss_queue_full_per_sm;
-  /// Percent (0--100) for above-threshold; default 80.
+  /// Per SM: cycles where L1D miss queue has all m_miss_queue_size entries in use.
+  std::vector<unsigned long long> num_cycles_l1d_miss_queue_at_capacity_per_sm;
+  /// Per SM: cycles where miss queue occupancy >= miss_queue_occupancy_threshold_percent.
+  std::vector<unsigned long long>
+      num_cycles_l1d_miss_queue_above_threshold_per_sm;
+  /// Percent (0--100) for MSHR above-threshold; default 80.
   unsigned mshr_occupancy_threshold_percent;
+  /// Percent (0--100) for L1D miss queue above-threshold; default 80.
+  unsigned miss_queue_occupancy_threshold_percent;
 
   FuncCache get_cache_config(std::string kernel_name);
   void set_cache_config(std::string kernel_name, FuncCache cacheConfig);

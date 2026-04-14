@@ -1058,7 +1058,12 @@ gpgpu_sim::gpgpu_sim(const gpgpu_sim_config &config, gpgpu_context *ctx)
   num_l1d_mshr_entry_fail_per_sm.assign(m_shader_config->num_shader(), 0);
   num_l1d_mshr_merge_fail_per_sm.assign(m_shader_config->num_shader(), 0);
   num_l1d_miss_queue_full_per_sm.assign(m_shader_config->num_shader(), 0);
+  num_cycles_l1d_miss_queue_at_capacity_per_sm.assign(m_shader_config->num_shader(),
+                                                      0);
+  num_cycles_l1d_miss_queue_above_threshold_per_sm.assign(
+      m_shader_config->num_shader(), 0);
   mshr_occupancy_threshold_percent = 80;
+  miss_queue_occupancy_threshold_percent = 80;
 
   // Jin: functional simulation for CDP
   m_functional_sim = false;
@@ -1485,21 +1490,36 @@ void gpgpu_sim::gpu_print_stat(unsigned long long streamID) {
 
   printf("mshr_occupancy_threshold_percent = %u\n",
          mshr_occupancy_threshold_percent);
+  printf("miss_queue_occupancy_threshold_percent = %u\n",
+         miss_queue_occupancy_threshold_percent);
   printf("num_cycles_mshr_full_total = %llu\n",
          get_num_cycles_mshr_full_total());
   printf("num_cycles_mshr_above_threshold_total = %llu\n",
          get_num_cycles_mshr_above_threshold_total());
+  printf("num_cycles_l1d_miss_queue_at_capacity_total = %llu\n",
+         get_num_cycles_l1d_miss_queue_at_capacity_total());
+  printf("num_cycles_l1d_miss_queue_above_threshold_total = %llu\n",
+         get_num_cycles_l1d_miss_queue_above_threshold_total());
   {
     unsigned long long mshr_full_max = 0, mshr_above_max = 0;
+    unsigned long long mq_cap_max = 0, mq_thr_max = 0;
     for (size_t s = 0; s < num_cycles_mshr_full_per_sm.size(); s++) {
       if (num_cycles_mshr_full_per_sm[s] > mshr_full_max)
         mshr_full_max = num_cycles_mshr_full_per_sm[s];
       if (num_cycles_mshr_above_threshold_per_sm[s] > mshr_above_max)
         mshr_above_max = num_cycles_mshr_above_threshold_per_sm[s];
+      if (num_cycles_l1d_miss_queue_at_capacity_per_sm[s] > mq_cap_max)
+        mq_cap_max = num_cycles_l1d_miss_queue_at_capacity_per_sm[s];
+      if (num_cycles_l1d_miss_queue_above_threshold_per_sm[s] > mq_thr_max)
+        mq_thr_max = num_cycles_l1d_miss_queue_above_threshold_per_sm[s];
     }
     printf("num_cycles_mshr_full_per_sm_max = %llu\n", mshr_full_max);
     printf("num_cycles_mshr_above_threshold_per_sm_max = %llu\n",
            mshr_above_max);
+    printf("num_cycles_l1d_miss_queue_at_capacity_per_sm_max = %llu\n",
+           mq_cap_max);
+    printf("num_cycles_l1d_miss_queue_above_threshold_per_sm_max = %llu\n",
+           mq_thr_max);
   }
   printf("num_l1d_mshr_reservation_fail_total = %llu\n",
          get_num_l1d_mshr_reservation_fail_total());
@@ -1531,6 +1551,10 @@ void gpgpu_sim::gpu_print_stat(unsigned long long streamID) {
            num_cycles_mshr_full_per_sm[sid]);
     printf("num_cycles_mshr_above_threshold_per_sm[%u] = %llu\n", sid,
            num_cycles_mshr_above_threshold_per_sm[sid]);
+    printf("num_cycles_l1d_miss_queue_at_capacity_per_sm[%u] = %llu\n", sid,
+           num_cycles_l1d_miss_queue_at_capacity_per_sm[sid]);
+    printf("num_cycles_l1d_miss_queue_above_threshold_per_sm[%u] = %llu\n", sid,
+           num_cycles_l1d_miss_queue_above_threshold_per_sm[sid]);
     printf("num_l1d_mshr_reservation_fail_per_sm[%u] = %llu\n", sid,
            num_l1d_mshr_reservation_fail_per_sm[sid]);
     printf("num_l1d_mshr_entry_fail_per_sm[%u] = %llu\n", sid,
@@ -2043,10 +2067,16 @@ void gpgpu_sim::accumulate_mshr_l1d_stats() {
     for (unsigned j = 0; j < m_shader_config->n_simt_cores_per_cluster; j++) {
       unsigned sid = m_shader_config->cid_to_sid(j, cid);
       l1_cache *l1d = m_cluster[cid]->get_shader_core(j)->get_l1d_cache();
+      if (!l1d) continue;
       if (l1d->mshr_occupancy_at_capacity()) num_cycles_mshr_full_per_sm[sid]++;
       if (l1d->mshr_occupancy_above_threshold(
               mshr_occupancy_threshold_percent))
         num_cycles_mshr_above_threshold_per_sm[sid]++;
+      if (l1d->miss_queue_at_capacity())
+        num_cycles_l1d_miss_queue_at_capacity_per_sm[sid]++;
+      if (l1d->miss_queue_occupancy_above_threshold(
+              miss_queue_occupancy_threshold_percent))
+        num_cycles_l1d_miss_queue_above_threshold_per_sm[sid]++;
     }
   }
 }
@@ -2070,6 +2100,32 @@ unsigned long long gpgpu_sim::get_num_cycles_mshr_full_total() const {
 unsigned long long gpgpu_sim::get_num_cycles_mshr_above_threshold_total() const {
   return std::accumulate(num_cycles_mshr_above_threshold_per_sm.begin(),
                          num_cycles_mshr_above_threshold_per_sm.end(), 0ull);
+}
+
+unsigned long long gpgpu_sim::get_num_cycles_l1d_miss_queue_at_capacity(
+    unsigned sid) const {
+  assert(sid < num_cycles_l1d_miss_queue_at_capacity_per_sm.size());
+  return num_cycles_l1d_miss_queue_at_capacity_per_sm[sid];
+}
+
+unsigned long long gpgpu_sim::get_num_cycles_l1d_miss_queue_at_capacity_total()
+    const {
+  return std::accumulate(num_cycles_l1d_miss_queue_at_capacity_per_sm.begin(),
+                         num_cycles_l1d_miss_queue_at_capacity_per_sm.end(),
+                         0ull);
+}
+
+unsigned long long gpgpu_sim::get_num_cycles_l1d_miss_queue_above_threshold(
+    unsigned sid) const {
+  assert(sid < num_cycles_l1d_miss_queue_above_threshold_per_sm.size());
+  return num_cycles_l1d_miss_queue_above_threshold_per_sm[sid];
+}
+
+unsigned long long gpgpu_sim::get_num_cycles_l1d_miss_queue_above_threshold_total()
+    const {
+  return std::accumulate(
+      num_cycles_l1d_miss_queue_above_threshold_per_sm.begin(),
+      num_cycles_l1d_miss_queue_above_threshold_per_sm.end(), 0ull);
 }
 
 unsigned long long gpgpu_sim::get_num_l1d_mshr_reservation_fail(

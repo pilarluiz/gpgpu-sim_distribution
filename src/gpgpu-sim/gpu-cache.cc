@@ -1266,6 +1266,19 @@ bool baseline_cache::mshr_occupancy_above_threshold(
   return m_mshrs.occupancy_above_threshold(threshold_percent);
 }
 
+bool baseline_cache::miss_queue_at_capacity() const {
+  return m_config.m_miss_queue_size > 0 &&
+         m_miss_queue.size() >= m_config.m_miss_queue_size;
+}
+
+bool baseline_cache::miss_queue_occupancy_above_threshold(
+    unsigned threshold_percent) const {
+  unsigned cap = m_config.m_miss_queue_size;
+  if (cap == 0) return false;
+  double occupancy_percent = 100.0 * (double)m_miss_queue.size() / (double)cap;
+  return occupancy_percent >= (double)threshold_percent;
+}
+
 /// Interface for response from lower memory level (model bandwidth restictions
 /// in caller)
 void baseline_cache::fill(mem_fetch *mf, unsigned time) {
