@@ -371,6 +371,9 @@ enum concrete_scheduler {
   CONCRETE_SCHEDULER_RRR,
   CONCRETE_SCHEDULER_WARP_LIMITING,
   CONCRETE_SCHEDULER_OLDEST_FIRST,
+  /// L1D miss-queue or MSHR occupancy >= gpgpu_sim thresholds: prioritize
+  /// warps whose next instruction is not a MEM-pipe load/store.
+  CONCRETE_SCHEDULER_REACTIVE_MEM,
   NUM_CONCRETE_SCHEDULERS
 };
 
@@ -541,6 +544,25 @@ class gto_scheduler : public scheduler_unit {
                        sfu_out, int_out, tensor_core_out, spec_cores_out,
                        mem_out, id) {}
   virtual ~gto_scheduler() {}
+  virtual void order_warps();
+  virtual void done_adding_supervised_warps() {
+    m_last_supervised_issued = m_supervised_warps.begin();
+  }
+};
+
+class reactive_mem_scheduler : public scheduler_unit {
+ public:
+  reactive_mem_scheduler(shader_core_stats *stats, shader_core_ctx *shader,
+                           Scoreboard *scoreboard, simt_stack **simt,
+                           std::vector<shd_warp_t *> *warp, register_set *sp_out,
+                           register_set *dp_out, register_set *sfu_out,
+                           register_set *int_out, register_set *tensor_core_out,
+                           std::vector<register_set *> &spec_cores_out,
+                           register_set *mem_out, int id)
+      : scheduler_unit(stats, shader, scoreboard, simt, warp, sp_out, dp_out,
+                       sfu_out, int_out, tensor_core_out, spec_cores_out,
+                       mem_out, id) {}
+  virtual ~reactive_mem_scheduler() {}
   virtual void order_warps();
   virtual void done_adding_supervised_warps() {
     m_last_supervised_issued = m_supervised_warps.begin();

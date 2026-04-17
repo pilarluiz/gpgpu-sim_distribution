@@ -192,7 +192,9 @@ void shader_core_ctx::create_schedulers() {
   // must currently occur after all inputs have been initialized.
   std::string sched_config = m_config->gpgpu_scheduler_string;
   const concrete_scheduler scheduler =
-      sched_config.find("lrr") != std::string::npos ? CONCRETE_SCHEDULER_LRR
+      sched_config.find("reactive_mem") != std::string::npos
+          ? CONCRETE_SCHEDULER_REACTIVE_MEM
+      : sched_config.find("lrr") != std::string::npos ? CONCRETE_SCHEDULER_LRR
       : sched_config.find("two_level_active") != std::string::npos
           ? CONCRETE_SCHEDULER_TWO_LEVEL_ACTIVE
       : sched_config.find("gto") != std::string::npos ? CONCRETE_SCHEDULER_GTO
@@ -224,6 +226,14 @@ void shader_core_ctx::create_schedulers() {
         break;
       case CONCRETE_SCHEDULER_GTO:
         schedulers.push_back(new gto_scheduler(
+            m_stats, this, m_scoreboard, m_simt_stack, &m_warp,
+            &m_pipeline_reg[ID_OC_SP], &m_pipeline_reg[ID_OC_DP],
+            &m_pipeline_reg[ID_OC_SFU], &m_pipeline_reg[ID_OC_INT],
+            &m_pipeline_reg[ID_OC_TENSOR_CORE], m_specilized_dispatch_reg,
+            &m_pipeline_reg[ID_OC_MEM], i));
+        break;
+      case CONCRETE_SCHEDULER_REACTIVE_MEM:
+        schedulers.push_back(new reactive_mem_scheduler(
             m_stats, this, m_scoreboard, m_simt_stack, &m_warp,
             &m_pipeline_reg[ID_OC_SP], &m_pipeline_reg[ID_OC_DP],
             &m_pipeline_reg[ID_OC_SFU], &m_pipeline_reg[ID_OC_INT],
@@ -1603,6 +1613,96 @@ void gto_scheduler::order_warps() {
                     m_last_supervised_issued, m_supervised_warps.size(),
                     ORDERING_GREEDY_THEN_PRIORITY_FUNC,
                     scheduler_unit::sort_warps_by_oldest_dynamic_id);
+}
+
+// File-local helpers for reactive_mem_scheduler::order_warps() only (internal
+// linkage: not visible outside this .cc). Used to classify warps and to pick
+// the GTO "greedy" warp when ordering a subset of supervised warps.
+
+namespace {
+
+// True if the next instruction in the ibuffer uses the MEM execution path
+// (same op filter as scheduler_unit::cycle when issuing to m_mem_out).
+bool warp_next_is_mem_pipe_inst(shd_warp_t *w) {
+  if (!w || w->waiting() || w->done_exit() || w->ibuffer_empty()) return false;
+  const warp_inst_t *pI = w->ibuffer_next_inst();
+  if (!pI) return false;
+  return pI->op == LOAD_OP || pI->op == STORE_OP ||
+         pI->op == MEMORY_BARRIER_OP || pI->op == TENSOR_CORE_LOAD_OP ||
+         pI->op == TENSOR_CORE_STORE_OP;
+}
+
+// For order_by_priority's greedy slot: find which warp in `sub` was last
+// issued from the full supervised list; if none match, use sub.begin().
+std::vector<shd_warp_t *>::const_iterator greedy_iter_in_subset(
+    const std::vector<shd_warp_t *> &sub,
+    const std::vector<shd_warp_t *> &supervised,
+    std::vector<shd_warp_t *>::const_iterator last_issued) {
+  if (sub.empty()) return sub.end();
+  for (std::vector<shd_warp_t *>::const_iterator it = sub.begin();
+       it != sub.end(); ++it) {
+    if (last_issued != supervised.end() && *it == *last_issued) return it;
+  }
+  return sub.begin();
+}
+
+}  // namespace
+
+void reactive_mem_scheduler::order_warps() {
+  l1_cache *l1d = m_shader->get_l1d_cache();
+  bool pressure = false;
+  if (l1d) {
+    gpgpu_sim *gpu = m_shader->get_gpu();
+    unsigned mq_thr = gpu->get_miss_queue_occupancy_threshold_percent();
+    unsigned mshr_thr = gpu->get_mshr_occupancy_threshold_percent();
+    pressure = l1d->miss_queue_occupancy_above_threshold(mq_thr) ||
+               l1d->mshr_occupancy_above_threshold(mshr_thr);
+  }
+  if (!pressure) {
+    order_by_priority(m_next_cycle_prioritized_warps, m_supervised_warps,
+                      m_last_supervised_issued, m_supervised_warps.size(),
+                      ORDERING_GREEDY_THEN_PRIORITY_FUNC,
+                      scheduler_unit::sort_warps_by_oldest_dynamic_id);
+    return;
+  }
+
+  std::vector<shd_warp_t *> non_mem;
+  std::vector<shd_warp_t *> mem_first;
+  non_mem.reserve(m_supervised_warps.size());
+  mem_first.reserve(m_supervised_warps.size());
+  for (unsigned k = 0; k < m_supervised_warps.size(); k++) {
+    shd_warp_t *w = m_supervised_warps[k];
+    if (warp_next_is_mem_pipe_inst(w))
+      mem_first.push_back(w);
+    else
+      non_mem.push_back(w);
+  }
+
+  m_next_cycle_prioritized_warps.clear();
+  std::vector<shd_warp_t *> ordered_non_mem;
+  std::vector<shd_warp_t *> ordered_mem;
+  if (!non_mem.empty()) {
+    order_by_priority(
+        ordered_non_mem, non_mem,
+        greedy_iter_in_subset(non_mem, m_supervised_warps,
+                              m_last_supervised_issued),
+        non_mem.size(), ORDERING_GREEDY_THEN_PRIORITY_FUNC,
+        scheduler_unit::sort_warps_by_oldest_dynamic_id);
+    m_next_cycle_prioritized_warps.insert(m_next_cycle_prioritized_warps.end(),
+                                          ordered_non_mem.begin(),
+                                          ordered_non_mem.end());
+  }
+  if (!mem_first.empty()) {
+    order_by_priority(
+        ordered_mem, mem_first,
+        greedy_iter_in_subset(mem_first, m_supervised_warps,
+                              m_last_supervised_issued),
+        mem_first.size(), ORDERING_GREEDY_THEN_PRIORITY_FUNC,
+        scheduler_unit::sort_warps_by_oldest_dynamic_id);
+    m_next_cycle_prioritized_warps.insert(m_next_cycle_prioritized_warps.end(),
+                                          ordered_mem.begin(),
+                                          ordered_mem.end());
+  }
 }
 
 void oldest_scheduler::order_warps() {
