@@ -507,6 +507,10 @@ class gpgpu_sim_config : public power_config,
   // statistics collection
   int gpu_stat_sample_freq;
   int gpu_runtime_stat_flag;
+  unsigned gpgpu_l1d_window_cycles;
+  bool gpgpu_l1d_window_trace_enabled;
+  unsigned gpgpu_l1d_window_trace_period;
+  char *gpgpu_l1d_window_trace_filename;
 
   // Device Limits
   size_t stack_size_limit;
@@ -576,6 +580,7 @@ class watchpoint_event {
 class gpgpu_sim : public gpgpu_t {
  public:
   gpgpu_sim(const gpgpu_sim_config &config, gpgpu_context *ctx);
+  virtual ~gpgpu_sim();
 
   void set_prop(struct cudaDeviceProp *prop);
 
@@ -682,6 +687,8 @@ class gpgpu_sim : public gpgpu_t {
   void shader_print_scheduler_stat(FILE *fout, bool print_dynamic_info) const;
   void visualizer_printstat();
   void print_shader_cycle_distro(FILE *fout) const;
+  void update_l1d_windowed_stats();
+  void l1d_window_trace_sample();
 
   void gpgpu_debug();
 
@@ -775,6 +782,20 @@ class gpgpu_sim : public gpgpu_t {
   unsigned long long partiton_replys_in_parallel;
   unsigned long long partiton_replys_in_parallel_total;
 
+  unsigned m_l1d_window_size;
+  unsigned m_l1d_window_index;
+  unsigned m_l1d_window_valid_entries;
+  std::vector<unsigned long long> m_l1d_window_accesses;
+  std::vector<unsigned long long> m_l1d_window_misses;
+  std::vector<unsigned long long> m_l1d_window_insn;
+  unsigned long long m_l1d_window_sum_accesses;
+  unsigned long long m_l1d_window_sum_misses;
+  unsigned long long m_l1d_window_sum_insn;
+  unsigned long long m_last_l1d_total_accesses;
+  unsigned long long m_last_l1d_total_misses;
+  unsigned long long m_last_gpu_sim_insn_for_window;
+  FILE *m_l1d_window_trace_fp;
+
   FuncCache get_cache_config(std::string kernel_name);
   void set_cache_config(std::string kernel_name, FuncCache cacheConfig);
   bool has_special_cache_config(std::string kernel_name);
@@ -802,6 +823,16 @@ class gpgpu_sim : public gpgpu_t {
     assert(m_functional_sim_kernel == k);
     m_functional_sim = false;
     m_functional_sim_kernel = NULL;
+  }
+
+  double get_l1d_window_miss_rate() const {
+    if (m_l1d_window_sum_accesses == 0) return 0.0;
+    return (double)m_l1d_window_sum_misses / (double)m_l1d_window_sum_accesses;
+  }
+  double get_l1d_window_mpki() const {
+    if (m_l1d_window_sum_insn == 0) return 0.0;
+    return (double)m_l1d_window_sum_misses * 1000.0 /
+           (double)m_l1d_window_sum_insn;
   }
 };
 

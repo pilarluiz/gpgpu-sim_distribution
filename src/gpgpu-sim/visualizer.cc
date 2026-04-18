@@ -76,6 +76,9 @@ void gpgpu_sim::visualizer_printstat() {
   gzprintf(visualizer_file, "globalcyclecount: %lld\n", gpu_sim_cycle);
   gzprintf(visualizer_file, "globalinsncount: %lld\n", gpu_sim_insn);
   gzprintf(visualizer_file, "globaltotinsncount: %lld\n", gpu_tot_sim_insn);
+  gzprintf(visualizer_file, "L1D_window_cache_miss_rate: %.6lf\n",
+           get_l1d_window_miss_rate());
+  gzprintf(visualizer_file, "L1D_window_mpki: %.6lf\n", get_l1d_window_mpki());
 
   time_vector_print_interval2gzfile(visualizer_file);
 

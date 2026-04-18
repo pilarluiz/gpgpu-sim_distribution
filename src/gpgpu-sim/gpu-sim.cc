@@ -685,6 +685,26 @@ void gpgpu_sim_config::reg_options(option_parser_t opp) {
       opp, "-gpgpu_runtime_stat", OPT_CSTR, &gpgpu_runtime_stat,
       "display runtime statistics such as dram utilization {<freq>:<flag>}",
       "10000:0");
+  option_parser_register(opp, "-gpgpu_l1d_window_cycles", OPT_UINT32,
+                         &gpgpu_l1d_window_cycles,
+                         "Sliding window size (cycles) for L1D miss rate/MPKI",
+                         "512");
+  option_parser_register(opp, "-gpgpu_l1d_window_trace_enabled", OPT_BOOL,
+                         &gpgpu_l1d_window_trace_enabled,
+                         "Write CSV time series of sliding-window L1D miss rate "
+                         "and MPKI (1=on, 0=off)",
+                         "0");
+  option_parser_register(
+      opp, "-gpgpu_l1d_window_trace_period", OPT_UINT32,
+      &gpgpu_l1d_window_trace_period,
+      "Sample period in core cycles for L1D window trace (1=every core cycle; "
+      "larger reduces file size)",
+      "1");
+  option_parser_register(opp, "-gpgpu_l1d_window_trace_filename", OPT_CSTR,
+                         &gpgpu_l1d_window_trace_filename,
+                         "Output CSV for L1D window trace (cycle,miss_rate,mpki,"
+                         "window_accesses,window_misses,window_insn)",
+                         "l1d_window_trace.csv");
   option_parser_register(opp, "-liveness_message_freq", OPT_INT64,
                          &liveness_message_freq,
                          "Minimum number of seconds between simulation "
@@ -1012,6 +1032,34 @@ gpgpu_sim::gpgpu_sim(const gpgpu_sim_config &config, gpgpu_context *ctx)
   partiton_replys_in_parallel = 0;
   partiton_replys_in_parallel_total = 0;
   last_streamID = -1;
+  m_l1d_window_size = m_config.gpgpu_l1d_window_cycles;
+  if (m_l1d_window_size == 0) m_l1d_window_size = 1;
+  m_l1d_window_index = 0;
+  m_l1d_window_valid_entries = 0;
+  m_l1d_window_accesses.assign(m_l1d_window_size, 0);
+  m_l1d_window_misses.assign(m_l1d_window_size, 0);
+  m_l1d_window_insn.assign(m_l1d_window_size, 0);
+  m_l1d_window_sum_accesses = 0;
+  m_l1d_window_sum_misses = 0;
+  m_l1d_window_sum_insn = 0;
+  m_last_l1d_total_accesses = 0;
+  m_last_l1d_total_misses = 0;
+  m_last_gpu_sim_insn_for_window = 0;
+  m_l1d_window_trace_fp = NULL;
+  if (m_config.gpgpu_l1d_window_trace_enabled) {
+    const char *fn = m_config.gpgpu_l1d_window_trace_filename;
+    if (fn == NULL || fn[0] == '\0') fn = "l1d_window_trace.csv";
+    m_l1d_window_trace_fp = fopen(fn, "w");
+    if (m_l1d_window_trace_fp) {
+      fprintf(m_l1d_window_trace_fp,
+              "cycle,miss_rate,mpki,window_accesses,window_misses,window_insn\n");
+      fflush(m_l1d_window_trace_fp);
+    } else {
+      printf(
+          "GPGPU-Sim uArch: WARNING: could not open L1D window trace file '%s'\n",
+          fn);
+    }
+  }
 
   gpu_kernel_time.clear();
 
@@ -1054,6 +1102,14 @@ gpgpu_sim::gpgpu_sim(const gpgpu_sim_config &config, gpgpu_context *ctx)
   // Jin: functional simulation for CDP
   m_functional_sim = false;
   m_functional_sim_kernel = NULL;
+}
+
+gpgpu_sim::~gpgpu_sim() {
+  if (m_l1d_window_trace_fp) {
+    fflush(m_l1d_window_trace_fp);
+    fclose(m_l1d_window_trace_fp);
+    m_l1d_window_trace_fp = NULL;
+  }
 }
 
 void sst_gpgpu_sim::SST_receive_mem_reply(unsigned core_id, void *mem_req) {
@@ -1192,6 +1248,19 @@ void gpgpu_sim::init() {
   gpu_sim_cycle = 0;
   gpu_sim_insn = 0;
   last_gpu_sim_insn = 0;
+  m_l1d_window_size = m_config.gpgpu_l1d_window_cycles;
+  if (m_l1d_window_size == 0) m_l1d_window_size = 1;
+  m_l1d_window_index = 0;
+  m_l1d_window_valid_entries = 0;
+  m_l1d_window_accesses.assign(m_l1d_window_size, 0);
+  m_l1d_window_misses.assign(m_l1d_window_size, 0);
+  m_l1d_window_insn.assign(m_l1d_window_size, 0);
+  m_l1d_window_sum_accesses = 0;
+  m_l1d_window_sum_misses = 0;
+  m_l1d_window_sum_insn = 0;
+  m_last_l1d_total_accesses = 0;
+  m_last_l1d_total_misses = 0;
+  m_last_gpu_sim_insn_for_window = 0;
   m_total_cta_launched = 0;
   gpu_completed_cta = 0;
   partiton_reqs_in_parallel = 0;
@@ -1254,6 +1323,66 @@ void gpgpu_sim::update_stats() {
   m_total_cta_launched = 0;
   gpu_completed_cta = 0;
   gpu_occupancy = occupancy_stats();
+}
+
+void gpgpu_sim::update_l1d_windowed_stats() {
+  unsigned long long total_accesses = 0;
+  unsigned long long total_misses = 0;
+  if (!m_shader_config->m_L1D_config.disabled()) {
+    cache_sub_stats css;
+    css.clear();
+    for (unsigned i = 0; i < m_shader_config->n_simt_clusters; i++) {
+      m_cluster[i]->get_L1D_sub_stats(css);
+      total_accesses += css.accesses;
+      total_misses += css.misses;
+    }
+  }
+
+  const unsigned long long accesses_delta =
+      (total_accesses >= m_last_l1d_total_accesses)
+          ? (total_accesses - m_last_l1d_total_accesses)
+          : 0;
+  const unsigned long long misses_delta =
+      (total_misses >= m_last_l1d_total_misses)
+          ? (total_misses - m_last_l1d_total_misses)
+          : 0;
+  const unsigned long long insn_delta =
+      (gpu_sim_insn >= m_last_gpu_sim_insn_for_window)
+          ? (gpu_sim_insn - m_last_gpu_sim_insn_for_window)
+          : 0;
+
+  if (m_l1d_window_valid_entries == m_l1d_window_size) {
+    m_l1d_window_sum_accesses -= m_l1d_window_accesses[m_l1d_window_index];
+    m_l1d_window_sum_misses -= m_l1d_window_misses[m_l1d_window_index];
+    m_l1d_window_sum_insn -= m_l1d_window_insn[m_l1d_window_index];
+  } else {
+    m_l1d_window_valid_entries++;
+  }
+
+  m_l1d_window_accesses[m_l1d_window_index] = accesses_delta;
+  m_l1d_window_misses[m_l1d_window_index] = misses_delta;
+  m_l1d_window_insn[m_l1d_window_index] = insn_delta;
+  m_l1d_window_sum_accesses += accesses_delta;
+  m_l1d_window_sum_misses += misses_delta;
+  m_l1d_window_sum_insn += insn_delta;
+  m_l1d_window_index = (m_l1d_window_index + 1) % m_l1d_window_size;
+
+  m_last_l1d_total_accesses = total_accesses;
+  m_last_l1d_total_misses = total_misses;
+  m_last_gpu_sim_insn_for_window = gpu_sim_insn;
+  l1d_window_trace_sample();
+}
+
+void gpgpu_sim::l1d_window_trace_sample() {
+  if (!m_l1d_window_trace_fp) return;
+  unsigned period = m_config.gpgpu_l1d_window_trace_period;
+  if (period == 0) period = 1;
+  const unsigned long long g = gpu_tot_sim_cycle + gpu_sim_cycle;
+  if ((g % period) != 0) return;
+  fprintf(m_l1d_window_trace_fp, "%llu,%.12g,%.12g,%llu,%llu,%llu\n", g,
+          get_l1d_window_miss_rate(), get_l1d_window_mpki(),
+          m_l1d_window_sum_accesses, m_l1d_window_sum_misses,
+          m_l1d_window_sum_insn);
 }
 
 PowerscalingCoefficients *gpgpu_sim::get_scaling_coeffs() {
@@ -1463,6 +1592,9 @@ void gpgpu_sim::gpu_print_stat(unsigned long long streamID) {
                                        (gpu_tot_sim_cycle + gpu_sim_cycle));
   printf("gpu_tot_issued_cta = %lld\n",
          gpu_tot_issued_cta + m_total_cta_launched);
+  printf("L1D_window_size_cycles = %u\n", m_l1d_window_size);
+  printf("L1D_window_cache_miss_rate = %.4lf\n", get_l1d_window_miss_rate());
+  printf("L1D_window_mpki = %.4lf\n", get_l1d_window_mpki());
   printf("gpu_occupancy = %.4f%% \n", gpu_occupancy.get_occ_fraction() * 100);
   printf("gpu_tot_occupancy = %.4f%% \n",
          (gpu_occupancy + gpu_tot_occupancy).get_occ_fraction() * 100);
@@ -2094,6 +2226,7 @@ void gpgpu_sim::cycle() {
       raise(SIGTRAP);  // Debug breakpoint
     }
     gpu_sim_cycle++;
+    update_l1d_windowed_stats();
 
     if (g_interactive_debugger_enabled) gpgpu_debug();
 
@@ -2342,6 +2475,7 @@ void sst_gpgpu_sim::SST_cycle() {
     asm("int $03");
   }
   gpu_sim_cycle++;
+  update_l1d_windowed_stats();
   if (g_interactive_debugger_enabled) gpgpu_debug();
 
     // McPAT main cycle (interface with McPAT)
