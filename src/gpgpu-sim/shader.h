@@ -239,6 +239,11 @@ class shd_warp_t {
   }
   void ibuffer_step() { m_next = (m_next + 1) % IBUFFER_SIZE; }
 
+  /// True if any of the next up to `max_ahead` buffered instructions (in issue
+  /// order, starting at m_next) use the MEM execution path. `max_ahead` is
+  /// capped at IBUFFER_SIZE (2): we can only see what is already fetched.
+  bool ibuffer_has_mem_pipe_within(unsigned max_ahead) const;
+
   bool imiss_pending() const { return m_imiss_pending; }
   void set_imiss_pending() { m_imiss_pending = true; }
   void clear_imiss_pending() { m_imiss_pending = false; }

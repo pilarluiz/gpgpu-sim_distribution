@@ -1621,15 +1621,12 @@ void gto_scheduler::order_warps() {
 
 namespace {
 
-// True if the next instruction in the ibuffer uses the MEM execution path
-// (same op filter as scheduler_unit::cycle when issuing to m_mem_out).
+// True if any buffered instruction in issue order (up to IBUFFER_SIZE) uses
+// the MEM execution path — same op filter as scheduler_unit::cycle when
+// issuing to m_mem_out. With a 2-entry ibuffer this is "next or the one after".
 bool warp_next_is_mem_pipe_inst(shd_warp_t *w) {
   if (!w || w->waiting() || w->done_exit() || w->ibuffer_empty()) return false;
-  const warp_inst_t *pI = w->ibuffer_next_inst();
-  if (!pI) return false;
-  return pI->op == LOAD_OP || pI->op == STORE_OP ||
-         pI->op == MEMORY_BARRIER_OP || pI->op == TENSOR_CORE_LOAD_OP ||
-         pI->op == TENSOR_CORE_STORE_OP;
+  return w->ibuffer_has_mem_pipe_within(2);
 }
 
 // For order_by_priority's greedy slot: find which warp in `sub` was last
@@ -4253,6 +4250,23 @@ void shd_warp_t::print_ibuffer(FILE *fout) const {
       fprintf(fout, " <empty> ");
   }
   fprintf(fout, "\n");
+}
+
+bool shd_warp_t::ibuffer_has_mem_pipe_within(unsigned max_ahead) const {
+  if (ibuffer_empty()) return false;
+  unsigned limit = max_ahead;
+  if (limit > IBUFFER_SIZE) limit = IBUFFER_SIZE;
+  for (unsigned i = 0; i < limit; i++) {
+    unsigned idx = (m_next + i) % IBUFFER_SIZE;
+    if (!m_ibuffer[idx].m_valid) continue;
+    const warp_inst_t *pI = m_ibuffer[idx].m_inst;
+    if (!pI) continue;
+    if (pI->op == LOAD_OP || pI->op == STORE_OP ||
+        pI->op == MEMORY_BARRIER_OP || pI->op == TENSOR_CORE_LOAD_OP ||
+        pI->op == TENSOR_CORE_STORE_OP)
+      return true;
+  }
+  return false;
 }
 
 void opndcoll_rfu_t::add_cu_set(unsigned set_id, unsigned num_cu,
