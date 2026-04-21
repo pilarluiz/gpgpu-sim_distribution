@@ -1599,6 +1599,18 @@ bool scheduler_unit::sort_warps_by_oldest_dynamic_id(shd_warp_t *lhs,
   }
 }
 
+bool scheduler_unit::warp_next_inst_operands_ready(shd_warp_t *w) {
+  if (!w || w->done_exit() || w->waiting() || w->ibuffer_empty()) return false;
+  const warp_inst_t *pI = w->ibuffer_next_inst();
+  if (!pI || !w->ibuffer_next_valid()) return false;
+  unsigned warp_id = w->get_warp_id();
+  unsigned pc, rpc;
+  m_shader->get_pdom_stack_top_info(warp_id, pI, &pc, &rpc);
+  if (pc != pI->pc) return false;
+  if (pI->m_is_cdp && w->m_cdp_latency > 0) return false;
+  return !m_scoreboard->checkCollision(warp_id, pI);
+}
+
 void lrr_scheduler::order_warps() {
   order_lrr(m_next_cycle_prioritized_warps, m_supervised_warps,
             m_last_supervised_issued, m_supervised_warps.size());
@@ -1643,6 +1655,29 @@ std::vector<shd_warp_t *>::const_iterator greedy_iter_in_subset(
   return sub.begin();
 }
 
+// Set only while reactive_mem_scheduler::order_warps runs the pressure path,
+// so sort_warps_ready_then_oldest_dynamic_id can call warp_next_inst_operands_ready.
+static const scheduler_unit *g_reactive_priority_sched = nullptr;
+
+bool sort_warps_ready_then_oldest_dynamic_id(shd_warp_t *lhs, shd_warp_t *rhs) {
+  const scheduler_unit *su = g_reactive_priority_sched;
+  assert(su);
+  if (rhs && lhs) {
+    if (lhs->done_exit() || lhs->waiting()) {
+      return false;
+    } else if (rhs->done_exit() || rhs->waiting()) {
+      return true;
+    } else {
+      bool lr = su->warp_next_inst_operands_ready(lhs);
+      bool rr = su->warp_next_inst_operands_ready(rhs);
+      if (lr != rr) return lr;
+      return lhs->get_dynamic_warp_id() < rhs->get_dynamic_warp_id();
+    }
+  } else {
+    return lhs < rhs;
+  }
+}
+
 }  // namespace
 
 void reactive_mem_scheduler::order_warps() {
@@ -1678,13 +1713,14 @@ void reactive_mem_scheduler::order_warps() {
   m_next_cycle_prioritized_warps.clear();
   std::vector<shd_warp_t *> ordered_non_mem;
   std::vector<shd_warp_t *> ordered_mem;
+  g_reactive_priority_sched = this;
   if (!non_mem.empty()) {
     order_by_priority(
         ordered_non_mem, non_mem,
         greedy_iter_in_subset(non_mem, m_supervised_warps,
                               m_last_supervised_issued),
         non_mem.size(), ORDERING_GREEDY_THEN_PRIORITY_FUNC,
-        scheduler_unit::sort_warps_by_oldest_dynamic_id);
+        sort_warps_ready_then_oldest_dynamic_id);
     m_next_cycle_prioritized_warps.insert(m_next_cycle_prioritized_warps.end(),
                                           ordered_non_mem.begin(),
                                           ordered_non_mem.end());
@@ -1695,11 +1731,12 @@ void reactive_mem_scheduler::order_warps() {
         greedy_iter_in_subset(mem_first, m_supervised_warps,
                               m_last_supervised_issued),
         mem_first.size(), ORDERING_GREEDY_THEN_PRIORITY_FUNC,
-        scheduler_unit::sort_warps_by_oldest_dynamic_id);
+        sort_warps_ready_then_oldest_dynamic_id);
     m_next_cycle_prioritized_warps.insert(m_next_cycle_prioritized_warps.end(),
                                           ordered_mem.begin(),
                                           ordered_mem.end());
   }
+  g_reactive_priority_sched = nullptr;
 }
 
 void oldest_scheduler::order_warps() {

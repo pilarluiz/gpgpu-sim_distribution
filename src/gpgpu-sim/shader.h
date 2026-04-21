@@ -452,6 +452,11 @@ class scheduler_unit {  // this can be copied freely, so can be used in std
       bool (*priority_func)(U lhs, U rhs));
   static bool sort_warps_by_oldest_dynamic_id(shd_warp_t *lhs, shd_warp_t *rhs);
 
+  /// True if the warp's next ibuffer instruction can pass the scoreboard (no
+  /// RAW collision), control matches the SIMT stack, and CDP latency is not
+  /// blocking — same notion of "ready" as the first issue attempt in cycle().
+  bool warp_next_inst_operands_ready(shd_warp_t *w);
+
   // Derived classes can override this function to populate
   // m_supervised_warps with their scheduling policies
   virtual void order_warps() = 0;
