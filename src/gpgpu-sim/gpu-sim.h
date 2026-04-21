@@ -520,6 +520,11 @@ class gpgpu_sim_config : public power_config,
   unsigned int gpgpu_compute_capability_minor;
   unsigned long long liveness_message_freq;
 
+  /// L1D MSHR occupancy %% (0--100) for stats and reactive_mem "pressure" (default 80).
+  unsigned gpgpu_mshr_occupancy_threshold_percent;
+  /// L1D miss-queue occupancy %% (0--100) for stats and reactive_mem "pressure" (default 80).
+  unsigned gpgpu_miss_queue_occupancy_threshold_percent;
+
   friend class gpgpu_sim;
   friend class sst_gpgpu_sim;
 };

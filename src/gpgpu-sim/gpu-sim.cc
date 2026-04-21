@@ -704,6 +704,18 @@ void gpgpu_sim_config::reg_options(option_parser_t opp) {
                          &gpgpu_flush_l2_cache,
                          "Flush L2 cache at the end of each kernel call", "0");
   option_parser_register(
+      opp, "-gpgpu_mshr_occupancy_threshold_percent", OPT_UINT32,
+      &gpgpu_mshr_occupancy_threshold_percent,
+      "L1D MSHR occupancy %% at/above which stats count 'above threshold' and "
+      "reactive_mem treats L1D as under pressure (0-100)",
+      "80");
+  option_parser_register(
+      opp, "-gpgpu_miss_queue_occupancy_threshold_percent", OPT_UINT32,
+      &gpgpu_miss_queue_occupancy_threshold_percent,
+      "L1D miss-queue occupancy %% at/above which stats count 'above threshold' "
+      "and reactive_mem treats L1D as under pressure (0-100)",
+      "80");
+  option_parser_register(
       opp, "-gpgpu_deadlock_detect", OPT_BOOL, &gpu_deadlock_detect,
       "Stop the simulation at deadlock (1=on (default), 0=off)", "1");
   option_parser_register(
@@ -1062,8 +1074,10 @@ gpgpu_sim::gpgpu_sim(const gpgpu_sim_config &config, gpgpu_context *ctx)
                                                       0);
   num_cycles_l1d_miss_queue_above_threshold_per_sm.assign(
       m_shader_config->num_shader(), 0);
-  mshr_occupancy_threshold_percent = 80;
-  miss_queue_occupancy_threshold_percent = 80;
+  mshr_occupancy_threshold_percent =
+      m_config.gpgpu_mshr_occupancy_threshold_percent;
+  miss_queue_occupancy_threshold_percent =
+      m_config.gpgpu_miss_queue_occupancy_threshold_percent;
 
   // Jin: functional simulation for CDP
   m_functional_sim = false;
