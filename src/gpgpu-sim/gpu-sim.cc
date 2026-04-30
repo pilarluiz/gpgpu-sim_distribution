@@ -323,6 +323,21 @@ void memory_config::reg_options(class OptionParser *opp) {
   // SST mode activate
   option_parser_register(opp, "-SST_mode", OPT_BOOL, &SST_mode, "SST mode",
                          "0");
+
+  // L1<->L2 coalescing buffer options.
+  option_parser_register(
+      opp, "-gpgpu_l1_l2_coalesce_buffer_size", OPT_UINT32,
+      &l1_l2_coalesce_buffer_size,
+      "Size (number of entries) of the L1<->L2 coalescing buffer in each "
+      "memory sub-partition. 0 disables the buffer (default).",
+      "0");
+  option_parser_register(
+      opp, "-gpgpu_l1_l2_coalesce_min_cycles", OPT_UINT32,
+      &l1_l2_coalesce_min_cycles,
+      "Minimum number of cycles a request must spend in the L1<->L2 "
+      "coalescing buffer before it is eligible to access the L2 cache.",
+      "0");
+
   m_address_mapping.addrdec_setoption(opp);
 }
 

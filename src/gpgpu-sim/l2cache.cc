@@ -427,6 +427,9 @@ memory_sub_partition::memory_sub_partition(unsigned sub_partition_id,
   m_stats = stats;
   m_gpu = gpu;
   m_memcpy_cycle_offset = 0;
+  m_coalesce_enqueues = 0;
+  m_coalesce_merged = 0;
+  m_coalesce_drained = 0;
 
   assert(m_id < m_config->m_n_mem_sub_partition);
 
@@ -462,8 +465,79 @@ memory_sub_partition::~memory_sub_partition() {
   delete m_L2interface;
 }
 
+bool memory_sub_partition::coalesce_buffer_enabled() const {
+  return m_config->l1_l2_coalesce_buffer_size > 0;
+}
+
+void memory_sub_partition::coalesce_reply_follower(mem_fetch *fmf) {
+  // Queue the follower to be replied. Actual push to m_L2_icnt_queue
+  // happens in cache_cycle (once per cycle, bandwidth-bounded) so that
+  // large follower bursts do not overrun the fifo's max length.
+  m_coalesce_follower_reply_queue.push(fmf);
+}
+
+bool memory_sub_partition::coalesce_buffer_admit(mem_fetch *mf,
+                                                 unsigned long long cycle) {
+  // Writes and write-back/write-allocate traffic do not merge; only plain
+  // reads bound for the L2 are coalesce candidates. Writes still take a
+  // slot in the buffer (so they feel the min-hold delay uniformly), but
+  // they are never matched as followers.
+  bool l2_target =
+      !m_config->m_L2_config.disabled() &&
+      ((m_config->m_L2_texure_only && mf->istexture()) ||
+       (!m_config->m_L2_texure_only));
+  bool mergeable = l2_target && !mf->is_write() &&
+                   mf->get_access_type() != L1_WRBK_ACC &&
+                   mf->get_access_type() != L2_WRBK_ACC &&
+                   mf->get_access_type() != L2_WR_ALLOC_R;
+  new_addr_type blk =
+      !m_config->m_L2_config.disabled()
+          ? m_config->m_L2_config.block_addr(mf->get_addr())
+          : mf->get_addr();
+  if (mergeable) {
+    for (std::list<coalesce_buffer_entry>::iterator it =
+             m_coalesce_buffer.begin();
+         it != m_coalesce_buffer.end(); ++it) {
+      if (!it->is_write && it->block_addr == blk) {
+        it->followers.push_back(mf);
+        mf->set_status(IN_PARTITION_ICNT_TO_L2_QUEUE, cycle);
+        m_coalesce_merged++;
+        return true;
+      }
+    }
+  }
+  if (m_coalesce_buffer.size() >= m_config->l1_l2_coalesce_buffer_size) {
+    return false;  // buffer is full; caller must retry next cycle
+  }
+  coalesce_buffer_entry entry;
+  entry.primary = mf;
+  entry.arrival_cycle = cycle;
+  entry.is_write = mf->is_write();
+  entry.block_addr = blk;
+  m_coalesce_buffer.push_back(entry);
+  m_coalesce_enqueues++;
+  mf->set_status(IN_PARTITION_ICNT_TO_L2_QUEUE, cycle);
+  return true;
+}
+
 void memory_sub_partition::cache_cycle(unsigned cycle) {
-  // L2 fill responses
+  // ------------------------------------------------------------------
+  // Emit one queued coalesced-follower reply per cycle if L2->icnt has
+  // room. Followers are enqueued when their primary hits L2 or when the
+  // primary's L2 fill response returns.
+  // ------------------------------------------------------------------
+  if (!m_coalesce_follower_reply_queue.empty() && !m_L2_icnt_queue->full()) {
+    mem_fetch *fmf = m_coalesce_follower_reply_queue.front();
+    m_coalesce_follower_reply_queue.pop();
+    fmf->set_reply();
+    fmf->set_status(IN_PARTITION_L2_TO_ICNT_QUEUE,
+                    m_gpu->gpu_sim_cycle + m_gpu->gpu_tot_sim_cycle);
+    m_L2_icnt_queue->push(fmf);
+  }
+
+  // ------------------------------------------------------------------
+  // L2 fill responses (primary replies + any piggy-backed followers).
+  // ------------------------------------------------------------------
   if (!m_config->m_L2_config.disabled()) {
     if (m_L2cache->access_ready() && !m_L2_icnt_queue->full()) {
       mem_fetch *mf = m_L2cache->next_access();
@@ -487,10 +561,27 @@ void memory_sub_partition::cache_cycle(unsigned cycle) {
         m_request_tracker.erase(mf);
         delete mf;
       }
+      // Deliver replies for any followers that coalesced onto this
+      // primary while it was outstanding in the L2.
+      std::unordered_map<mem_fetch *,
+                         std::vector<mem_fetch *> >::iterator fit =
+          m_coalesce_outstanding_followers.find(mf);
+      if (fit != m_coalesce_outstanding_followers.end()) {
+        for (unsigned i = 0; i < fit->second.size(); i++) {
+          // If the L2->icnt queue ever runs out of room here we still
+          // push; fifo_pipeline accepts beyond max_len (it just reports
+          // full()). The caller of the drain stage is responsible for
+          // ensuring enough space before admitting the primary.
+          coalesce_reply_follower(fit->second[i]);
+        }
+        m_coalesce_outstanding_followers.erase(fit);
+      }
     }
   }
 
+  // ------------------------------------------------------------------
   // DRAM to L2 (texture) and icnt (not texture)
+  // ------------------------------------------------------------------
   if (!m_dram_L2_queue->empty()) {
     mem_fetch *mf = m_dram_L2_queue->top();
     if (!m_config->m_L2_config.disabled() && m_L2cache->waiting_for_fill(mf)) {
@@ -513,75 +604,198 @@ void memory_sub_partition::cache_cycle(unsigned cycle) {
   // prior L2 misses inserted into m_L2_dram_queue here
   if (!m_config->m_L2_config.disabled()) m_L2cache->cycle();
 
-  // new L2 texture accesses and/or non-texture accesses
-  if (!m_L2_dram_queue->full() && !m_icnt_L2_queue->empty()) {
-    mem_fetch *mf = m_icnt_L2_queue->top();
-    if (!m_config->m_L2_config.disabled() &&
-        ((m_config->m_L2_texure_only && mf->istexture()) ||
-         (!m_config->m_L2_texure_only))) {
-      // L2 is enabled and access is for L2
-      bool output_full = m_L2_icnt_queue->full();
-      bool port_free = m_L2cache->data_port_free();
-      if (!output_full && port_free) {
-        std::list<cache_event> events;
-        enum cache_request_status status =
-            m_L2cache->access(mf->get_addr(), mf,
-                              m_gpu->gpu_sim_cycle + m_gpu->gpu_tot_sim_cycle +
-                                  m_memcpy_cycle_offset,
-                              events);
-        bool write_sent = was_write_sent(events);
-        bool read_sent = was_read_sent(events);
-        MEM_SUBPART_DPRINTF("Probing L2 cache Address=%llx, status=%u\n",
-                            mf->get_addr(), status);
+  // ------------------------------------------------------------------
+  // L2-access stage. When the coalescing buffer is enabled, requests
+  // first enter the buffer from m_icnt_L2_queue, then drain into the L2
+  // once they have aged past l1_l2_coalesce_min_cycles. When disabled,
+  // the original direct icnt_L2 -> L2 path is used.
+  // ------------------------------------------------------------------
+  if (coalesce_buffer_enabled()) {
+    // Drain one aged entry from the head of the coalescing buffer into
+    // the L2 cache (or L2-bypass path).
+    if (!m_L2_dram_queue->full() && !m_coalesce_buffer.empty()) {
+      coalesce_buffer_entry &entry = m_coalesce_buffer.front();
+      unsigned long long now =
+          m_gpu->gpu_sim_cycle + m_gpu->gpu_tot_sim_cycle;
+      bool aged = (now >=
+                   entry.arrival_cycle +
+                       (unsigned long long)m_config->l1_l2_coalesce_min_cycles);
 
-        if (status == HIT) {
-          if (!write_sent) {
-            // L2 cache replies
-            assert(!read_sent);
-            if (mf->get_access_type() == L1_WRBK_ACC) {
-              m_request_tracker.erase(mf);
-              delete mf;
+      if (aged) {
+        mem_fetch *mf = entry.primary;
+        bool l2_target =
+            !m_config->m_L2_config.disabled() &&
+            ((m_config->m_L2_texure_only && mf->istexture()) ||
+             (!m_config->m_L2_texure_only));
+        if (l2_target) {
+          bool output_full = m_L2_icnt_queue->full();
+          bool port_free = m_L2cache->data_port_free();
+          if (!output_full && port_free) {
+            std::list<cache_event> events;
+            enum cache_request_status status = m_L2cache->access(
+                mf->get_addr(), mf,
+                m_gpu->gpu_sim_cycle + m_gpu->gpu_tot_sim_cycle +
+                    m_memcpy_cycle_offset,
+                events);
+            bool write_sent = was_write_sent(events);
+            bool read_sent = was_read_sent(events);
+            MEM_SUBPART_DPRINTF(
+                "Probing L2 cache Address=%llx, status=%u (coalesce drain)\n",
+                mf->get_addr(), status);
+
+            if (status == HIT) {
+              if (!write_sent) {
+                assert(!read_sent);
+                if (mf->get_access_type() == L1_WRBK_ACC) {
+                  m_request_tracker.erase(mf);
+                  delete mf;
+                } else {
+                  mf->set_reply();
+                  mf->set_status(
+                      IN_PARTITION_L2_TO_ICNT_QUEUE,
+                      m_gpu->gpu_sim_cycle + m_gpu->gpu_tot_sim_cycle);
+                  m_L2_icnt_queue->push(mf);
+                }
+              } else {
+                assert(write_sent);
+              }
+              // HIT: all followers can be replied immediately as the
+              // primary's line is present in L2.
+              for (unsigned i = 0; i < entry.followers.size(); i++) {
+                coalesce_reply_follower(entry.followers[i]);
+              }
+              m_coalesce_buffer.pop_front();
+              m_coalesce_drained++;
+            } else if (status != RESERVATION_FAIL) {
+              if (mf->is_write() &&
+                  (m_config->m_L2_config.m_write_alloc_policy ==
+                       FETCH_ON_WRITE ||
+                   m_config->m_L2_config.m_write_alloc_policy ==
+                       LAZY_FETCH_ON_READ) &&
+                  !was_writeallocate_sent(events)) {
+                if (mf->get_access_type() == L1_WRBK_ACC) {
+                  m_request_tracker.erase(mf);
+                  delete mf;
+                } else if (m_config->m_L2_config.get_write_policy() ==
+                           WRITE_BACK) {
+                  mf->set_reply();
+                  mf->set_status(
+                      IN_PARTITION_L2_TO_ICNT_QUEUE,
+                      m_gpu->gpu_sim_cycle + m_gpu->gpu_tot_sim_cycle);
+                  m_L2_icnt_queue->push(mf);
+                }
+              }
+              // MISS accepted into L2: stash followers until the primary
+              // returns through the L2 fill path.
+              if (!entry.followers.empty()) {
+                m_coalesce_outstanding_followers[mf].insert(
+                    m_coalesce_outstanding_followers[mf].end(),
+                    entry.followers.begin(), entry.followers.end());
+              }
+              m_coalesce_buffer.pop_front();
+              m_coalesce_drained++;
             } else {
-              mf->set_reply();
-              mf->set_status(IN_PARTITION_L2_TO_ICNT_QUEUE,
-                             m_gpu->gpu_sim_cycle + m_gpu->gpu_tot_sim_cycle);
-              m_L2_icnt_queue->push(mf);
+              // L2 cache lock-up; leave head entry in buffer and retry.
+              assert(!write_sent);
+              assert(!read_sent);
+            }
+          }
+        } else {
+          // L2 disabled / non-texture access to texture-only L2: the
+          // primary bypasses L2 straight to the L2->DRAM queue. Followers
+          // should be empty in this path (admit rejects merging when
+          // !l2_target), but guard defensively.
+          mf->set_status(IN_PARTITION_L2_TO_DRAM_QUEUE,
+                         m_gpu->gpu_sim_cycle + m_gpu->gpu_tot_sim_cycle);
+          m_L2_dram_queue->push(mf);
+          for (unsigned i = 0; i < entry.followers.size(); i++) {
+            coalesce_reply_follower(entry.followers[i]);
+          }
+          m_coalesce_buffer.pop_front();
+          m_coalesce_drained++;
+        }
+      }
+    }
+
+    // Admit one request from the icnt->L2 queue into the coalescing
+    // buffer each cycle. If the buffer is full and the request cannot be
+    // merged into an existing entry, it stays in the icnt queue and we
+    // retry next cycle (back-pressure).
+    if (!m_icnt_L2_queue->empty()) {
+      mem_fetch *incoming = m_icnt_L2_queue->top();
+      if (coalesce_buffer_admit(
+              incoming, m_gpu->gpu_sim_cycle + m_gpu->gpu_tot_sim_cycle)) {
+        m_icnt_L2_queue->pop();
+      }
+    }
+  } else {
+    // Original direct icnt_L2_queue -> L2 access path.
+    if (!m_L2_dram_queue->full() && !m_icnt_L2_queue->empty()) {
+      mem_fetch *mf = m_icnt_L2_queue->top();
+      if (!m_config->m_L2_config.disabled() &&
+          ((m_config->m_L2_texure_only && mf->istexture()) ||
+           (!m_config->m_L2_texure_only))) {
+        bool output_full = m_L2_icnt_queue->full();
+        bool port_free = m_L2cache->data_port_free();
+        if (!output_full && port_free) {
+          std::list<cache_event> events;
+          enum cache_request_status status =
+              m_L2cache->access(mf->get_addr(), mf,
+                                m_gpu->gpu_sim_cycle +
+                                    m_gpu->gpu_tot_sim_cycle +
+                                    m_memcpy_cycle_offset,
+                                events);
+          bool write_sent = was_write_sent(events);
+          bool read_sent = was_read_sent(events);
+          MEM_SUBPART_DPRINTF("Probing L2 cache Address=%llx, status=%u\n",
+                              mf->get_addr(), status);
+
+          if (status == HIT) {
+            if (!write_sent) {
+              assert(!read_sent);
+              if (mf->get_access_type() == L1_WRBK_ACC) {
+                m_request_tracker.erase(mf);
+                delete mf;
+              } else {
+                mf->set_reply();
+                mf->set_status(IN_PARTITION_L2_TO_ICNT_QUEUE,
+                               m_gpu->gpu_sim_cycle + m_gpu->gpu_tot_sim_cycle);
+                m_L2_icnt_queue->push(mf);
+              }
+              m_icnt_L2_queue->pop();
+            } else {
+              assert(write_sent);
+              m_icnt_L2_queue->pop();
+            }
+          } else if (status != RESERVATION_FAIL) {
+            if (mf->is_write() &&
+                (m_config->m_L2_config.m_write_alloc_policy == FETCH_ON_WRITE ||
+                 m_config->m_L2_config.m_write_alloc_policy ==
+                     LAZY_FETCH_ON_READ) &&
+                !was_writeallocate_sent(events)) {
+              if (mf->get_access_type() == L1_WRBK_ACC) {
+                m_request_tracker.erase(mf);
+                delete mf;
+              } else if (m_config->m_L2_config.get_write_policy() ==
+                         WRITE_BACK) {
+                mf->set_reply();
+                mf->set_status(IN_PARTITION_L2_TO_ICNT_QUEUE,
+                               m_gpu->gpu_sim_cycle + m_gpu->gpu_tot_sim_cycle);
+                m_L2_icnt_queue->push(mf);
+              }
             }
             m_icnt_L2_queue->pop();
           } else {
-            assert(write_sent);
-            m_icnt_L2_queue->pop();
+            assert(!write_sent);
+            assert(!read_sent);
           }
-        } else if (status != RESERVATION_FAIL) {
-          if (mf->is_write() &&
-              (m_config->m_L2_config.m_write_alloc_policy == FETCH_ON_WRITE ||
-               m_config->m_L2_config.m_write_alloc_policy ==
-                   LAZY_FETCH_ON_READ) &&
-              !was_writeallocate_sent(events)) {
-            if (mf->get_access_type() == L1_WRBK_ACC) {
-              m_request_tracker.erase(mf);
-              delete mf;
-            } else if (m_config->m_L2_config.get_write_policy() == WRITE_BACK) {
-              mf->set_reply();
-              mf->set_status(IN_PARTITION_L2_TO_ICNT_QUEUE,
-                             m_gpu->gpu_sim_cycle + m_gpu->gpu_tot_sim_cycle);
-              m_L2_icnt_queue->push(mf);
-            }
-          }
-          // L2 cache accepted request
-          m_icnt_L2_queue->pop();
-        } else {
-          assert(!write_sent);
-          assert(!read_sent);
-          // L2 cache lock-up: will try again next cycle
         }
+      } else {
+        mf->set_status(IN_PARTITION_L2_TO_DRAM_QUEUE,
+                       m_gpu->gpu_sim_cycle + m_gpu->gpu_tot_sim_cycle);
+        m_L2_dram_queue->push(mf);
+        m_icnt_L2_queue->pop();
       }
-    } else {
-      // L2 is disabled or non-texture access to texture-only L2
-      mf->set_status(IN_PARTITION_L2_TO_DRAM_QUEUE,
-                     m_gpu->gpu_sim_cycle + m_gpu->gpu_tot_sim_cycle);
-      m_L2_dram_queue->push(mf);
-      m_icnt_L2_queue->pop();
     }
   }
 

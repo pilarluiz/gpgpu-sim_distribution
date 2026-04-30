@@ -37,6 +37,8 @@
 
 #include <list>
 #include <queue>
+#include <unordered_map>
+#include <vector>
 
 class mem_fetch;
 
@@ -207,6 +209,13 @@ class memory_sub_partition {
     m_memcpy_cycle_offset += 1;
   }
 
+  // Accessors used for printing coalescing-buffer statistics at end-of-sim.
+  unsigned long long get_coalesce_enqueues() const {
+    return m_coalesce_enqueues;
+  }
+  unsigned long long get_coalesce_merged() const { return m_coalesce_merged; }
+  unsigned long long get_coalesce_drained() const { return m_coalesce_drained; }
+
  private:
   // data
   unsigned m_id;  //< the global sub partition ID
@@ -228,6 +237,51 @@ class memory_sub_partition {
   fifo_pipeline<mem_fetch> *m_L2_dram_queue;
   fifo_pipeline<mem_fetch> *m_dram_L2_queue;
   fifo_pipeline<mem_fetch> *m_L2_icnt_queue;  // L2 cache hit response queue
+
+  // ---------------------------------------------------------------------
+  // L1<->L2 coalescing buffer.
+  //
+  // Sits between m_icnt_L2_queue and the L2 cache. Each entry tracks a
+  // "primary" request that will access the L2, plus any follower requests
+  // whose L2 cache-line address matches the primary's. Followers never
+  // access L2 themselves -- they ride back on the primary's reply when it
+  // returns. A primary is only eligible to access L2 after it has resided
+  // in the buffer for at least m_config->l1_l2_coalesce_min_cycles cycles.
+  struct coalesce_buffer_entry {
+    class mem_fetch *primary;
+    std::vector<class mem_fetch *> followers;
+    unsigned long long arrival_cycle;
+    new_addr_type block_addr;
+    bool is_write;
+  };
+  std::list<coalesce_buffer_entry> m_coalesce_buffer;
+
+  // Map from a primary mem_fetch that is outstanding in the L2 (miss in
+  // flight) to the set of follower mem_fetches that should be replied to
+  // when the primary's L2 response comes back.
+  std::unordered_map<class mem_fetch *, std::vector<class mem_fetch *> >
+      m_coalesce_outstanding_followers;
+
+  // Followers whose primary has already returned (or whose primary hit
+  // L2 when drained from the buffer) but for whom we have not yet had
+  // the L2->icnt queue bandwidth to emit a reply. Drained one entry per
+  // cycle to avoid overrunning m_L2_icnt_queue.
+  std::queue<class mem_fetch *> m_coalesce_follower_reply_queue;
+
+  // Statistics tracked by the coalescing buffer.
+  unsigned long long m_coalesce_enqueues;     // total requests entering buffer
+  unsigned long long m_coalesce_merged;       // requests merged as followers
+  unsigned long long m_coalesce_drained;      // primaries sent on to L2
+
+  // Helpers for the coalescing buffer.
+  bool coalesce_buffer_enabled() const;
+  // Try to insert mf from m_icnt_L2_queue into the coalescing buffer.
+  // Returns true if mf was consumed (merged or enqueued); false means
+  // caller should leave mf in the icnt queue and try again next cycle.
+  bool coalesce_buffer_admit(class mem_fetch *mf, unsigned long long cycle);
+  // Issue the reply for a follower on the L2->icnt queue. Assumes the
+  // L2->icnt queue is not full.
+  void coalesce_reply_follower(class mem_fetch *follower);
 
   class mem_fetch *L2dramout;
   unsigned long long int wb_addr;

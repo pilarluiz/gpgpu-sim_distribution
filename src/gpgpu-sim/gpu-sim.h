@@ -402,6 +402,18 @@ class memory_config {
   bool m_perf_sim_memcpy;
   bool simple_dram_model;
   bool SST_mode;
+
+  // L1<->L2 coalescing buffer configuration.
+  // When l1_l2_coalesce_buffer_size > 0, each memory sub-partition holds
+  // L1-originated requests in a coalescing buffer before granting them to
+  // the L2. Requests to the same L2 cache line (block address) are merged:
+  // a follower request is satisfied by the primary's L2 reply without
+  // issuing an additional L2 access. l1_l2_coalesce_min_cycles is the
+  // minimum number of cycles a primary must reside in the buffer before it
+  // is eligible to access L2.
+  unsigned l1_l2_coalesce_buffer_size;
+  unsigned l1_l2_coalesce_min_cycles;
+
   gpgpu_context *gpgpu_ctx;
 };
 
