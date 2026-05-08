@@ -1678,6 +1678,40 @@ void gpgpu_sim::gpu_print_stat(unsigned long long streamID) {
     }
   }
 
+  // L1<->L2 coalescing buffer stats.
+  {
+    unsigned long long total_enqueues = 0;
+    unsigned long long total_merged = 0;
+    unsigned long long total_drained = 0;
+    printf("\n========= L1<->L2 coalescing buffer stats =========\n");
+    printf("L1_L2_coalesce_buffer_size = %u\n",
+           m_memory_config->l1_l2_coalesce_buffer_size);
+    printf("L1_L2_coalesce_min_cycles = %u\n",
+           m_memory_config->l1_l2_coalesce_min_cycles);
+    for (unsigned i = 0; i < m_memory_config->m_n_mem_sub_partition; i++) {
+      unsigned long long enq = m_memory_sub_partition[i]->get_coalesce_enqueues();
+      unsigned long long mrg = m_memory_sub_partition[i]->get_coalesce_merged();
+      unsigned long long drn = m_memory_sub_partition[i]->get_coalesce_drained();
+      fprintf(stdout,
+              "L1_L2_coalesce_buffer[%u]: enqueues = %llu, merged = %llu, "
+              "drained = %llu\n",
+              i, enq, mrg, drn);
+      total_enqueues += enq;
+      total_merged += mrg;
+      total_drained += drn;
+    }
+    printf("L1_L2_coalesce_total_enqueues = %llu\n", total_enqueues);
+    printf("L1_L2_coalesce_total_merged = %llu\n", total_merged);
+    printf("L1_L2_coalesce_total_drained = %llu\n", total_drained);
+    unsigned long long total_admitted = total_enqueues + total_merged;
+    if (total_admitted > 0) {
+      printf("L1_L2_coalesce_merge_rate = %.4lf\n",
+             (double)total_merged / (double)total_admitted);
+    } else {
+      printf("L1_L2_coalesce_merge_rate = 0.0000\n");
+    }
+  }
+
   if (m_config.gpgpu_cflog_interval != 0) {
     spill_log_to_file(stdout, 1, gpu_sim_cycle);
     insn_warp_occ_print(stdout);
