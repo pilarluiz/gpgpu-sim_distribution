@@ -121,6 +121,10 @@ class shd_warp_t {
     m_last_fetch = 0;
     m_next = 0;
     m_streamID = (unsigned long long)-1;
+    // LTC: a freshly-reset warp slot is never masked; if it was masked before
+    // the prior warp completed the per-SM throttler bookkeeping is responsible
+    // for evicting it from the masked set (see shader_core_ctx::tick_throttler).
+    m_throttle_masked = false;
 
     // Jin: cdp support
     m_cdp_latency = 0;
@@ -278,6 +282,13 @@ class shd_warp_t {
     return m_shader;
   }
 
+  // Dynamic warp throttling (LTC): when set, the scheduler must skip this warp
+  // and not issue any new instructions for it.  In-flight instructions that
+  // already entered the pipeline are NOT cancelled and continue to drain
+  // normally, so older warps see less L1D contention without correctness loss.
+  bool is_throttle_masked() const { return m_throttle_masked; }
+  void set_throttle_masked(bool m) { m_throttle_masked = m; }
+
  private:
   static const unsigned IBUFFER_SIZE = 2;
   class shader_core_ctx *m_shader;
@@ -311,6 +322,11 @@ class shd_warp_t {
 
   bool m_done_exit;  // true once thread exit has been registered for threads in
                      // this warp
+
+  // LTC warp-disable mask bit (see is_throttle_masked()).  Asserted by the
+  // per-SM Localized Throttling Controller in shader_core_ctx when the L1D
+  // miss rate / MPKI exceed their engagement thresholds.
+  bool m_throttle_masked;
 
   unsigned long long m_last_fetch;
 
@@ -2423,6 +2439,27 @@ class shader_core_ctx : public core_t {
   }
   bool check_if_non_released_reduction_barrier(warp_inst_t &inst);
 
+  // ----- Localized Throttling Controller (LTC) -----
+  // Per-SM 512-cycle (configurable via -gpgpu_l1d_window_cycles) sliding
+  // window of L1D accesses, misses, and committed instructions.  Drives a
+  // hysteresis-based dynamic warp throttler: when the windowed miss rate AND
+  // MPKI both exceed their engagement thresholds, the N "youngest" warps
+  // (largest dynamic_warp_id) are masked from issuance; warps are
+  // reintroduced M at a time every K cycles after the metrics drop below
+  // both recovery thresholds for a sustained period.
+  void update_ltc_telemetry();
+  void tick_throttler();
+  double ltc_window_miss_rate() const;
+  double ltc_window_mpki() const;
+  unsigned get_ltc_num_masked_warps() const {
+    return (unsigned)m_ltc_masked_warps.size();
+  }
+  bool is_ltc_engaged() const { return m_ltc_engaged; }
+  unsigned long long get_ltc_engage_count() const { return m_ltc_engage_count; }
+  unsigned long long get_ltc_throttled_cycles() const {
+    return m_ltc_total_throttled_cycles;
+  }
+
  protected:
   unsigned inactive_lanes_accesses_sfu(unsigned active_count, double latency) {
     return (((32 - active_count) >> 1) * latency) +
@@ -2576,6 +2613,35 @@ class shader_core_ctx : public core_t {
   unsigned int m_occupied_ctas;
   std::bitset<MAX_THREAD_PER_SM> m_occupied_hwtid;
   std::map<unsigned int, unsigned int> m_occupied_cta_to_hwtid;
+
+  // ----- LTC private state -----
+  // Sliding window over the last m_ltc_window_size core cycles.
+  unsigned m_ltc_window_size;
+  unsigned m_ltc_window_index;
+  unsigned m_ltc_window_valid_entries;
+  std::vector<unsigned long long> m_ltc_window_accesses;
+  std::vector<unsigned long long> m_ltc_window_misses;
+  std::vector<unsigned long long> m_ltc_window_insn;
+  unsigned long long m_ltc_sum_accesses;
+  unsigned long long m_ltc_sum_misses;
+  unsigned long long m_ltc_sum_insn;
+  // Cumulative counters from the previous tick, used to compute deltas.
+  unsigned long long m_ltc_last_l1d_accesses;
+  unsigned long long m_ltc_last_l1d_misses;
+  unsigned long long m_ltc_last_insn;
+  // Throttler FSM state.
+  bool m_ltc_engaged;
+  std::set<unsigned> m_ltc_masked_warps;        // warp slot indices currently masked
+  unsigned long long m_ltc_below_recover_cycles;
+  unsigned long long m_ltc_last_unmask_cycle;
+  // Stats.
+  unsigned long long m_ltc_engage_count;
+  unsigned long long m_ltc_recover_count;
+  unsigned long long m_ltc_total_throttled_cycles;
+
+  void engage_throttler();
+  void try_unmask_some(unsigned m_count);
+  void prune_done_warps_from_mask();
 };
 
 class exec_shader_core_ctx : public shader_core_ctx {

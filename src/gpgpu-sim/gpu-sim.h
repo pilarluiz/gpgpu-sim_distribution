@@ -467,6 +467,29 @@ class gpgpu_sim_config : public power_config,
 
   bool flush_l1() const { return gpgpu_flush_l1_cache; }
 
+  // Sliding-window/LTC accessors (public so per-SM throttlers in shader_core_ctx
+  // can read configuration through gpgpu_sim::get_config()).
+  unsigned l1d_window_cycles_value() const { return gpgpu_l1d_window_cycles; }
+  bool warp_throttler_enabled() const { return gpgpu_warp_throttler_enabled; }
+  double warp_throttler_miss_rate_engage() const {
+    return gpgpu_warp_throttler_miss_rate_engage;
+  }
+  double warp_throttler_miss_rate_recover() const {
+    return gpgpu_warp_throttler_miss_rate_recover;
+  }
+  double warp_throttler_mpki_engage() const {
+    return gpgpu_warp_throttler_mpki_engage;
+  }
+  double warp_throttler_mpki_recover() const {
+    return gpgpu_warp_throttler_mpki_recover;
+  }
+  unsigned warp_throttler_unmask_count_M() const {
+    return gpgpu_warp_throttler_unmask_count_M;
+  }
+  unsigned warp_throttler_unmask_period_K() const {
+    return gpgpu_warp_throttler_unmask_period_K;
+  }
+
  private:
   void init_clock_domains(void);
 
@@ -511,6 +534,21 @@ class gpgpu_sim_config : public power_config,
   bool gpgpu_l1d_window_trace_enabled;
   unsigned gpgpu_l1d_window_trace_period;
   char *gpgpu_l1d_window_trace_filename;
+
+  // Dynamic warp throttler (Localized Throttling Controller, LTC).
+  // Per-SM telemetry uses the same 512-cycle sliding window as
+  // gpgpu_l1d_window_cycles; engagement and recovery thresholds are independent
+  // (no fixed 15% relationship).  Only on/off + thresholds + the M/K unmask
+  // ramp parameters are exposed; the number of warps frozen on engagement and
+  // the sustained-cycle requirement before recovery are compile-time defaults
+  // (see shader.cc).
+  bool gpgpu_warp_throttler_enabled;
+  double gpgpu_warp_throttler_miss_rate_engage;
+  double gpgpu_warp_throttler_miss_rate_recover;
+  double gpgpu_warp_throttler_mpki_engage;
+  double gpgpu_warp_throttler_mpki_recover;
+  unsigned gpgpu_warp_throttler_unmask_count_M;
+  unsigned gpgpu_warp_throttler_unmask_period_K;
 
   // Device Limits
   size_t stack_size_limit;

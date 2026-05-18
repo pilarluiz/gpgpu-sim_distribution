@@ -502,6 +502,33 @@ shader_core_ctx::shader_core_ctx(class gpgpu_sim *gpu,
   m_occupied_ctas = 0;
   m_occupied_hwtid.reset();
   m_occupied_cta_to_hwtid.clear();
+
+  // Localized Throttling Controller: per-SM telemetry sliding window.  Reuses
+  // the global -gpgpu_l1d_window_cycles option so the LTC observes the same
+  // window length the user already understands.
+  m_ltc_window_size = 1;
+  if (m_gpu) {
+    unsigned cfg_window = m_gpu->get_config().l1d_window_cycles_value();
+    if (cfg_window > 0) m_ltc_window_size = cfg_window;
+  }
+  m_ltc_window_index = 0;
+  m_ltc_window_valid_entries = 0;
+  m_ltc_window_accesses.assign(m_ltc_window_size, 0);
+  m_ltc_window_misses.assign(m_ltc_window_size, 0);
+  m_ltc_window_insn.assign(m_ltc_window_size, 0);
+  m_ltc_sum_accesses = 0;
+  m_ltc_sum_misses = 0;
+  m_ltc_sum_insn = 0;
+  m_ltc_last_l1d_accesses = 0;
+  m_ltc_last_l1d_misses = 0;
+  m_ltc_last_insn = 0;
+  m_ltc_engaged = false;
+  m_ltc_masked_warps.clear();
+  m_ltc_below_recover_cycles = 0;
+  m_ltc_last_unmask_cycle = 0;
+  m_ltc_engage_count = 0;
+  m_ltc_recover_count = 0;
+  m_ltc_total_throttled_cycles = 0;
 }
 
 void shader_core_ctx::reinit(unsigned start_thread, unsigned end_thread,
@@ -1270,8 +1297,11 @@ void scheduler_unit::cycle() {
   for (std::vector<shd_warp_t *>::const_iterator iter =
            m_next_cycle_prioritized_warps.begin();
        iter != m_next_cycle_prioritized_warps.end(); iter++) {
-    // Don't consider warps that are not yet valid
-    if ((*iter) == NULL || (*iter)->done_exit()) {
+    // Don't consider warps that are not yet valid, or that the per-SM LTC has
+    // masked off.  In-flight instructions for masked warps continue to drain
+    // through the pipeline normally; only new issues are blocked.
+    if ((*iter) == NULL || (*iter)->done_exit() ||
+        (*iter)->is_throttle_masked()) {
       continue;
     }
     SCHED_DPRINTF("Testing (warp_id %u, dynamic_warp_id %u)\n",
@@ -3682,6 +3712,11 @@ void shader_core_ctx::cycle() {
     decode();
     fetch();
   }
+  // Update sliding-window L1D telemetry and run the LTC FSM at the tail of
+  // the cycle so engagement/recovery decisions use this cycle's stats and the
+  // resulting warp-disable mask takes effect on the *next* scheduler cycle.
+  update_ltc_telemetry();
+  tick_throttler();
 }
 
 // Flushes all content of the cache to memory
@@ -4077,6 +4112,260 @@ void shader_core_ctx::get_icnt_power_stats(long &n_simt_to_mem,
                                            long &n_mem_to_simt) const {
   n_simt_to_mem += m_stats->n_simt_to_mem[m_sid];
   n_mem_to_simt += m_stats->n_mem_to_simt[m_sid];
+}
+
+// =====================================================================
+// Localized Throttling Controller (LTC) implementation
+// =====================================================================
+//
+// The LTC samples per-SM L1D miss rate and MPKI over a sliding window
+// (default 512 cycles, configurable via -gpgpu_l1d_window_cycles) and engages
+// a warp-disable mask when both metrics simultaneously exceed their
+// engagement thresholds (the "Critical Thrashing Threshold" from the spec).
+//
+// Hysteresis: engagement and recovery thresholds are independent
+// (-gpgpu_warp_throttler_miss_rate_engage / _recover and the corresponding
+// _mpki options).  Recovery starts only after BOTH metrics stay below their
+// recover thresholds for LTC_SUSTAIN_CYCLES consecutive cycles, after which
+// M warps are unmasked every K cycles until the masked set is empty.
+//
+// "Youngest" warps are defined as those with the largest dynamic_warp_id at
+// the moment of engagement.  We always leave at least one un-masked active
+// warp on the SM to avoid stalling the kernel; if all un-masked warps later
+// finish while the throttler is still engaged, we force-clear the mask as a
+// liveness safety net.
+
+namespace {
+// Number of youngest warps frozen on each engagement.  Compile-time default;
+// the user explicitly chose to keep this off the gpgpusim.config surface.
+static const unsigned LTC_N_WARPS_TO_FREEZE = 4;
+// Sustained period (cycles) the windowed metrics must stay below the recovery
+// thresholds before the gradual unmask ramp starts.
+static const unsigned long long LTC_SUSTAIN_CYCLES = 256;
+}  // namespace
+
+void shader_core_ctx::update_ltc_telemetry() {
+  if (m_ltc_window_size == 0) return;
+
+  // Pull cumulative L1D access/miss counters from the per-SM ldst_unit.
+  cache_sub_stats css;
+  css.clear();
+  if (m_ldst_unit) m_ldst_unit->get_L1D_sub_stats(css);
+  unsigned long long total_accesses = css.accesses;
+  unsigned long long total_misses = css.misses;
+  unsigned long long total_insn =
+      (unsigned long long)m_stats->m_num_sim_insn[m_sid];
+
+  // Convert cumulative counters to per-cycle deltas; guard against the very
+  // first sample (when the "last" snapshots are zero) and any pathological
+  // counter resets by clamping negative-looking deltas to zero.
+  unsigned long long accesses_delta =
+      (total_accesses >= m_ltc_last_l1d_accesses)
+          ? total_accesses - m_ltc_last_l1d_accesses
+          : 0;
+  unsigned long long misses_delta = (total_misses >= m_ltc_last_l1d_misses)
+                                        ? total_misses - m_ltc_last_l1d_misses
+                                        : 0;
+  unsigned long long insn_delta =
+      (total_insn >= m_ltc_last_insn) ? total_insn - m_ltc_last_insn : 0;
+
+  // Slide the ring buffer: drop the oldest entry, insert the new one.
+  if (m_ltc_window_valid_entries == m_ltc_window_size) {
+    m_ltc_sum_accesses -= m_ltc_window_accesses[m_ltc_window_index];
+    m_ltc_sum_misses -= m_ltc_window_misses[m_ltc_window_index];
+    m_ltc_sum_insn -= m_ltc_window_insn[m_ltc_window_index];
+  } else {
+    m_ltc_window_valid_entries++;
+  }
+  m_ltc_window_accesses[m_ltc_window_index] = accesses_delta;
+  m_ltc_window_misses[m_ltc_window_index] = misses_delta;
+  m_ltc_window_insn[m_ltc_window_index] = insn_delta;
+  m_ltc_sum_accesses += accesses_delta;
+  m_ltc_sum_misses += misses_delta;
+  m_ltc_sum_insn += insn_delta;
+  m_ltc_window_index = (m_ltc_window_index + 1) % m_ltc_window_size;
+
+  m_ltc_last_l1d_accesses = total_accesses;
+  m_ltc_last_l1d_misses = total_misses;
+  m_ltc_last_insn = total_insn;
+}
+
+double shader_core_ctx::ltc_window_miss_rate() const {
+  if (m_ltc_sum_accesses == 0) return 0.0;
+  return (double)m_ltc_sum_misses / (double)m_ltc_sum_accesses;
+}
+
+double shader_core_ctx::ltc_window_mpki() const {
+  if (m_ltc_sum_insn == 0) return 0.0;
+  return (double)m_ltc_sum_misses * 1000.0 / (double)m_ltc_sum_insn;
+}
+
+void shader_core_ctx::engage_throttler() {
+  // Build (dynamic_warp_id, slot) for every warp that is currently active and
+  // not already masked; pick the LTC_N_WARPS_TO_FREEZE largest dynamic_warp_id
+  // ones (i.e. the youngest), but always keep at least one un-masked active
+  // warp on the SM to avoid stalling the kernel.
+  std::vector<std::pair<unsigned, unsigned> > candidates;
+  for (unsigned i = 0; i < m_warp.size(); ++i) {
+    shd_warp_t *w = m_warp[i];
+    if (!w) continue;
+    if (w->done_exit() || w->functional_done()) continue;
+    if (w->is_throttle_masked()) continue;
+    candidates.push_back(std::make_pair(w->get_dynamic_warp_id(), i));
+  }
+  if (candidates.size() <= 1) {
+    return;  // not enough warps to safely throttle
+  }
+  std::sort(candidates.begin(), candidates.end(),
+            [](const std::pair<unsigned, unsigned> &a,
+               const std::pair<unsigned, unsigned> &b) {
+              return a.first > b.first;  // largest dynamic_warp_id first
+            });
+  unsigned to_mask =
+      std::min((unsigned)LTC_N_WARPS_TO_FREEZE,
+               (unsigned)(candidates.size() - 1));  // leave 1 un-masked
+  for (unsigned k = 0; k < to_mask; ++k) {
+    unsigned slot = candidates[k].second;
+    m_warp[slot]->set_throttle_masked(true);
+    m_ltc_masked_warps.insert(slot);
+  }
+  if (!m_ltc_masked_warps.empty()) {
+    m_ltc_engaged = true;
+  }
+}
+
+void shader_core_ctx::try_unmask_some(unsigned m_count) {
+  if (m_ltc_masked_warps.empty()) return;
+  if (m_count == 0) m_count = 1;
+  // Unmask the masked warps with the smallest dynamic_warp_id first (oldest
+  // among those throttled): they entered later than the still-running cohort
+  // but are the most-cached relative to remaining masked peers.
+  std::vector<std::pair<unsigned, unsigned> > ordered;
+  for (std::set<unsigned>::const_iterator it = m_ltc_masked_warps.begin();
+       it != m_ltc_masked_warps.end(); ++it) {
+    unsigned wid = *it;
+    if (wid >= m_warp.size() || !m_warp[wid]) continue;
+    ordered.push_back(std::make_pair(m_warp[wid]->get_dynamic_warp_id(), wid));
+  }
+  std::sort(ordered.begin(), ordered.end());  // ascending
+  unsigned step = std::min((unsigned)ordered.size(), m_count);
+  for (unsigned k = 0; k < step; ++k) {
+    unsigned slot = ordered[k].second;
+    m_warp[slot]->set_throttle_masked(false);
+    m_ltc_masked_warps.erase(slot);
+  }
+}
+
+void shader_core_ctx::prune_done_warps_from_mask() {
+  for (std::set<unsigned>::iterator it = m_ltc_masked_warps.begin();
+       it != m_ltc_masked_warps.end();) {
+    unsigned wid = *it;
+    bool drop = false;
+    if (wid >= m_warp.size() || m_warp[wid] == NULL) {
+      drop = true;
+    } else if (m_warp[wid]->done_exit() || m_warp[wid]->functional_done()) {
+      m_warp[wid]->set_throttle_masked(false);
+      drop = true;
+    }
+    if (drop)
+      m_ltc_masked_warps.erase(it++);
+    else
+      ++it;
+  }
+}
+
+void shader_core_ctx::tick_throttler() {
+  const gpgpu_sim_config &cfg = m_gpu->get_config();
+  if (!cfg.warp_throttler_enabled()) {
+    // If the user disabled throttling at runtime, drop any lingering masks.
+    if (!m_ltc_masked_warps.empty()) {
+      for (std::set<unsigned>::const_iterator it = m_ltc_masked_warps.begin();
+           it != m_ltc_masked_warps.end(); ++it) {
+        if (*it < m_warp.size() && m_warp[*it])
+          m_warp[*it]->set_throttle_masked(false);
+      }
+      m_ltc_masked_warps.clear();
+    }
+    m_ltc_engaged = false;
+    return;
+  }
+
+  // Always reconcile the masked set with warps that have completed since the
+  // last tick, regardless of FSM state.
+  prune_done_warps_from_mask();
+
+  if (m_ltc_engaged) m_ltc_total_throttled_cycles++;
+
+  // Don't make any decisions until the window has accumulated enough samples
+  // to give a meaningful miss-rate / MPKI estimate.
+  if (m_ltc_window_valid_entries < m_ltc_window_size) return;
+
+  const double mr = ltc_window_miss_rate();
+  const double mpki = ltc_window_mpki();
+  const unsigned long long now = m_gpu->gpu_sim_cycle + m_gpu->gpu_tot_sim_cycle;
+
+  if (!m_ltc_engaged) {
+    // Engage when BOTH the windowed miss rate and MPKI are at or above their
+    // engagement thresholds (the "Critical Thrashing Threshold" condition).
+    const bool engage_trigger =
+        (mr >= cfg.warp_throttler_miss_rate_engage()) &&
+        (mpki >= cfg.warp_throttler_mpki_engage());
+    if (engage_trigger) {
+      engage_throttler();
+      if (m_ltc_engaged) {
+        m_ltc_below_recover_cycles = 0;
+        m_ltc_last_unmask_cycle = now;
+        m_ltc_engage_count++;
+      }
+    }
+    return;
+  }
+
+  // ----- Engaged: track sustained-recovery condition and ramp warps back -----
+  const bool below_recover =
+      (mr <= cfg.warp_throttler_miss_rate_recover()) &&
+      (mpki <= cfg.warp_throttler_mpki_recover());
+  if (below_recover) {
+    m_ltc_below_recover_cycles++;
+  } else {
+    m_ltc_below_recover_cycles = 0;
+  }
+
+  // Liveness safety: if the kernel is about to drain and no un-masked active
+  // warps remain, clear the mask immediately so the SM can finish the kernel.
+  unsigned n_unmasked_active = 0;
+  for (unsigned i = 0; i < m_warp.size(); ++i) {
+    shd_warp_t *w = m_warp[i];
+    if (!w) continue;
+    if (w->done_exit() || w->functional_done()) continue;
+    if (w->is_throttle_masked()) continue;
+    n_unmasked_active++;
+  }
+  if (n_unmasked_active == 0 && !m_ltc_masked_warps.empty()) {
+    for (std::set<unsigned>::const_iterator it = m_ltc_masked_warps.begin();
+         it != m_ltc_masked_warps.end(); ++it) {
+      if (*it < m_warp.size() && m_warp[*it])
+        m_warp[*it]->set_throttle_masked(false);
+    }
+    m_ltc_masked_warps.clear();
+    m_ltc_engaged = false;
+    m_ltc_below_recover_cycles = 0;
+    m_ltc_recover_count++;
+    return;
+  }
+
+  if (m_ltc_below_recover_cycles >= LTC_SUSTAIN_CYCLES) {
+    unsigned K = cfg.warp_throttler_unmask_period_K();
+    if (K == 0) K = 1;
+    if (now - m_ltc_last_unmask_cycle >= (unsigned long long)K) {
+      try_unmask_some(cfg.warp_throttler_unmask_count_M());
+      m_ltc_last_unmask_cycle = now;
+      if (m_ltc_masked_warps.empty()) {
+        m_ltc_engaged = false;
+        m_ltc_recover_count++;
+      }
+    }
+  }
 }
 
 kernel_info_t *shd_warp_t::get_kernel_info() const {

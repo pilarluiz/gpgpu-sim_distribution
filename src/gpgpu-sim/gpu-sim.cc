@@ -705,6 +705,49 @@ void gpgpu_sim_config::reg_options(option_parser_t opp) {
                          "Output CSV for L1D window trace (cycle,miss_rate,mpki,"
                          "window_accesses,window_misses,window_insn)",
                          "l1d_window_trace.csv");
+  // Dynamic warp throttler (LTC) options.  See shader.cc for the per-SM
+  // engagement / recovery FSM.
+  option_parser_register(
+      opp, "-gpgpu_warp_throttler_enabled", OPT_BOOL,
+      &gpgpu_warp_throttler_enabled,
+      "Enable per-SM dynamic warp throttling (Localized Throttling Controller) "
+      "driven by the L1D sliding-window miss rate / MPKI (1=on, 0=off)",
+      "0");
+  option_parser_register(
+      opp, "-gpgpu_warp_throttler_miss_rate_engage", OPT_DOUBLE,
+      &gpgpu_warp_throttler_miss_rate_engage,
+      "LTC engagement threshold for the L1D miss rate (0.0..1.0).  The "
+      "throttler engages only when the windowed miss rate AND MPKI both "
+      "exceed their engagement thresholds.",
+      "0.50");
+  option_parser_register(
+      opp, "-gpgpu_warp_throttler_miss_rate_recover", OPT_DOUBLE,
+      &gpgpu_warp_throttler_miss_rate_recover,
+      "LTC recovery threshold for the L1D miss rate (0.0..1.0).  The "
+      "throttler begins reintroducing warps only after the miss rate AND "
+      "MPKI both stay below their recovery thresholds for a sustained "
+      "period.",
+      "0.40");
+  option_parser_register(
+      opp, "-gpgpu_warp_throttler_mpki_engage", OPT_DOUBLE,
+      &gpgpu_warp_throttler_mpki_engage,
+      "LTC engagement threshold for L1D MPKI (misses per kilo-instruction).",
+      "30.0");
+  option_parser_register(
+      opp, "-gpgpu_warp_throttler_mpki_recover", OPT_DOUBLE,
+      &gpgpu_warp_throttler_mpki_recover,
+      "LTC recovery threshold for L1D MPKI (misses per kilo-instruction).",
+      "20.0");
+  option_parser_register(
+      opp, "-gpgpu_warp_throttler_unmask_count_M", OPT_UINT32,
+      &gpgpu_warp_throttler_unmask_count_M,
+      "LTC recovery ramp: number of warps (M) to unmask per recovery step.",
+      "1");
+  option_parser_register(
+      opp, "-gpgpu_warp_throttler_unmask_period_K", OPT_UINT32,
+      &gpgpu_warp_throttler_unmask_period_K,
+      "LTC recovery ramp: period (K cycles) between successive unmask steps.",
+      "64");
   option_parser_register(opp, "-liveness_message_freq", OPT_INT64,
                          &liveness_message_freq,
                          "Minimum number of seconds between simulation "
